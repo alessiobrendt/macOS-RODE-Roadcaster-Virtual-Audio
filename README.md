@@ -496,7 +496,7 @@ UX feedback -- **the daemon re-validates the saved file itself and refuses
 to start on bad input; that's the real safety authority, not this UI**.
 "Apply (restarts daemon)" is the *only* way a change takes effect (save →
 stop → start, in that order, surfacing each step's progress/errors) --
-there is no live-reload/SIGHUP path in this round, and the button is
+there is currently no live-reload/SIGHUP path, and the button is
 disabled whenever there are no unsaved changes or the current values don't
 validate.
 
@@ -723,7 +723,7 @@ self-test stays deterministic and filesystem-independent regardless of
 what `config/channel-map.conf` currently contains. Applying a new mapping
 always requires stopping and restarting the daemon (via the GUI's
 "Apply (restarts daemon)" button, or manually) -- there is no
-SIGHUP/live-reload in this round.
+SIGHUP/live-reload support currently.
 
 ### Build it
 
@@ -794,10 +794,10 @@ SIGTERM handler cleans up its IOProcs) and deletes the installed plist.
 ### Manual live-testing safety notes (read before running this against real hardware)
 
 This is the one part of this whole project that moves real audio through
-real hardware in real time, and it has **not** been tested against the
-live "RODECaster Pro II Main Multitrack" device in this session by design
--- see "Known limitations" and the task history for why. Before you (with
-the coordinator) test it live:
+real hardware in real time. As of this writing it has not been exercised
+against the live "RODECaster Pro II Main Multitrack" device under
+sustained real-world use -- see "Known limitations" below for specifics.
+Before testing it live:
 
 - **Turn your system volume down first**, and turn down whatever's
   monitoring the RodeCaster's outputs (headphones, speakers). The first
@@ -937,14 +937,12 @@ for the HAL driver itself.
 - `bash -n installer/scripts/postinstall` (both the source file and the
   copy inside the expanded `.pkg`) -- valid syntax.
 
-**This package has deliberately NOT been double-clicked/run for real in
-this session.** Doing so would install the driver system-wide with
-`sudo`-equivalent privileges, restart the live `coreaudiod`, and set up a
-brand-new LaunchAgent for the real logged-in user -- the same
-"build-and-statically-verify-only, real installation happens later with
-the user present" rule this whole project follows for anything touching
-live system state. See "Next manual steps" for the actual, deliberate
-install step.
+**Treat running the installer as a deliberate, manual step**, not
+something to do casually while exploring this repo: installing it makes
+real, system-wide changes (installs the driver with elevated privileges,
+restarts the live `coreaudiod` -- briefly interrupting all system audio --
+and sets up a new LaunchAgent for your user account). See "Next manual
+steps" below for the recommended install sequence and safety notes.
 
 ## Known issues
 
@@ -1105,43 +1103,36 @@ All of these were run locally as part of building this project (see
 | `bash -n installer/scripts/postinstall` (source and expanded-pkg copy) | Valid syntax |
 | Live daemon process survived `make clean` + full rebuild of `build/` | Confirmed: same PID throughout (no restart), matching Unix unlink-while-open semantics |
 
-By the time this round of work started, the HAL driver and `rodevad-router`
-were **already installed and running live** against real RodeCaster Pro 2
-hardware (confirmed by the coordinator, and independently re-confirmed here
-via `launchctl list` and `ps` -- see the safety note below). This round's
-verification therefore focused on the new daemon/GUI code in isolation
-(compile, codesign, self-test, GUI build/lint/codesign/otool) rather than
-re-installing anything live, per this round's explicit constraints.
+Verification for the driver, `testtone`, the daemon, and the GUI has all
+been done through compilation, static analysis, code signing, and offline
+self-tests -- see the checks above and the per-component sections earlier
+in this README. **Not yet exercised as live, real-world runs**: the
+router daemon moving audio through the live Multitrack hardware over a
+sustained period, the GUI's Channel Mapping "Apply" button, the Restart
+tab's `coreaudiod` restart, the Login Item toggle's actual registration
+call, and double-clicking/running the built `.pkg` installer. See "Next
+manual steps" below for how to exercise these deliberately, and "Known
+limitations" above for what specifically remains unconfirmed about live
+hardware routing.
 
-**Not done this round, by design:** actually running the new
-`rodevad-router` build against the live Multitrack hardware, installing the
-new GUI's channel-map changes via its "Apply" button, clicking through the
-GUI at all (including the Restart tab's `coreaudiod` restart, the Auto
-Test sequence, or the Login Item toggle -- `SMAppService.mainApp.register()`
-was never called for real), double-clicking/running the built `.pkg`
-installer, or touching the live LaunchAgent (`launchctl load`/`unload`/
-`kickstart`, or overwriting `~/Library/LaunchAgents/com.abrendt.rodevad.router.plist`).
-See "Next manual steps" for what that requires.
-
-**Important safety note about the live daemon:** `make daemon`/`make gui`
-rebuild `build/rodevad-router` in place -- the exact path the currently
-*running* live daemon process was launched from. On macOS/Unix this is
-safe for the already-running process itself (it keeps executing the old
-code from memory; overwriting the file on disk doesn't retroactively
-change a process already running from it -- confirmed here by checking the
-live process's elapsed time continued uninterrupted across the rebuild).
-**However**, `com.abrendt.rodevad.router.plist` has `KeepAlive` configured
-to relaunch the daemon on any non-zero exit, using whatever binary is at
-that same path at the time. That means if the live process crashes, is
-manually restarted, or the Mac reboots *before* you've deliberately
-reviewed and accepted the new build, it will pick up this round's new
-(not yet live-tested) code automatically rather than the old, already-
-proven build. This wasn't avoidable while still following the instruction
-to build/verify into `build/` -- flagging it clearly here rather than
-leaving it as a silent risk. If you want a guaranteed-inert safety margin
-until you're ready to test deliberately, consider setting `KeepAlive` to
-`false` temporarily, or copying today's known-good binary aside before the
-next intentional restart.
+**Notes on live testing / rebuilding while a daemon is already running:**
+if you rebuild the daemon (`make daemon`/`make gui`) while an earlier
+build of it is already running (e.g. loaded as a LaunchAgent), be aware
+that both write to the same binary path the running process was launched
+from. On macOS/Unix this is safe for the process that's already running
+-- it keeps executing the version of the code it originally loaded into
+memory; overwriting the file on disk doesn't retroactively change a
+process already running from it. **However**, the LaunchAgent plist
+(`com.abrendt.rodevad.router.plist`) has `KeepAlive` configured to
+relaunch the daemon on any non-zero exit, using whatever binary happens
+to be on disk at that moment. That means if the running process crashes,
+is manually restarted, or the Mac reboots before you've deliberately
+tested a newly-built binary, it will pick up that new code automatically
+rather than continuing to run the previously-verified build. If you want
+a guaranteed-inert safety margin while testing a change, either stop the
+daemon first (`./daemon/uninstall-daemon.sh`), temporarily set
+`KeepAlive` to `false` in the plist, or copy a known-good binary aside
+before rebuilding.
 
 One real bug was caught and fixed during the original single-device build:
 the CFPlugIn factory function initially returned the address of the
@@ -1245,30 +1236,27 @@ RodeCasterVirtualAudio/
 
 ## Next manual steps (you run these yourself)
 
-**Current state as of this round:** the HAL driver (5 `RVAD *` devices) and
-`rodevad-router` are already installed and **running live** against real
-RodeCaster Pro 2 hardware, from this dev checkout (not yet from a `.pkg`
-install). This round added: GUI tabs (Dashboard w/ Login Item toggle,
-Levels, Channel Mapping w/ Reset to Defaults, Daemon, Restart), Auto Test
-mode on Channel Test, a real app icon, the RodeVADTester -> VAD rename, a
-self-contained app bundle, and a full `.pkg` installer -- all built,
-self-tested, and statically verified, but **none of it run live**, and the
-live LaunchAgent/process were deliberately left completely untouched
-throughout (no `launchctl load`/`unload`/`kickstart`, no edits to the
-installed `~/Library/LaunchAgents/com.abrendt.rodevad.router.plist`, no
-`.pkg` double-clicked, no `SMAppService.mainApp.register()` call made).
-**This needs the coordinator and user present together, watching/listening
-for anything that touches real audio** -- not run autonomously.
+**Current status:** the HAL driver (5 `RVAD *` devices) and
+`rodevad-router` can be installed and run live against real RodeCaster
+Pro 2 hardware, either from this dev checkout or via the `.pkg` installer.
+The GUI (Dashboard with Login Item toggle, Levels, Channel Mapping with
+Reset to Defaults, Daemon, and Restart tabs), Auto Test mode on Channel
+Test, the app icon, and the `.pkg` installer have all been built,
+self-tested, and statically verified -- see "Verification results" above
+for exactly what has and hasn't been exercised through sustained live use.
+**Perform the steps below deliberately, with volume turned down and
+someone present to watch/listen for anything that touches real audio** --
+don't run them unattended.
 
 ### A. Continue in dev-checkout mode (lower-risk, incremental)
 
-1. Read "Verification results" above's safety note about the live daemon
-   process and `KeepAlive` before doing anything else -- `build/rodevad-router`
-   already has this round's new code sitting at the same path the live
-   process was launched from; the live process itself is unaffected
-   (still running the old, proven code from memory -- confirmed to survive
-   even a full `make clean` + rebuild this round), but a crash/restart
-   before you're ready would auto-load the new build via `KeepAlive`.
+1. Read the "Notes on live testing / rebuilding while a daemon is already
+   running" note under "Verification results" above before doing anything
+   else -- if `build/rodevad-router` has been rebuilt since the live
+   daemon process last started, the running process itself is unaffected
+   (it keeps executing the old, proven code from memory), but a crash or
+   restart before you're ready to test the new build would auto-load it
+   via `KeepAlive`.
 2. When ready to test the new build deliberately (not by accident): with
    volume turned down, either let the current live process keep running
    as-is for now, or deliberately restart it via `./daemon/uninstall-daemon.sh`
@@ -1283,8 +1271,7 @@ for anything that touches real audio** -- not run autonomously.
 4. Confirm `state/rodevad-router.levels` is being rewritten roughly every
    75ms (`watch -n 0.2 cat state/rodevad-router.levels` or similar) --
    this is what the GUI's Levels tab reads.
-5. `make gui && open build/VAD.app` -- launch the GUI yourself (this was
-   deliberately not done for you this round). Check:
+5. `make gui && open build/VAD.app` -- launch the GUI and check:
    - **Dashboard**: all 4 status rows show green/good; try the "Launch
      VAD at Login" toggle (low-risk -- it only registers/unregisters a
      login item, doesn't touch audio) and confirm it reflects reality in
