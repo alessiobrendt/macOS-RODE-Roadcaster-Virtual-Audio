@@ -52,12 +52,18 @@
 
 #include <CoreAudio/CoreAudio.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <ctype.h>
+#include <errno.h>
+#include <math.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #pragma mark - Shared device identity (must match src/RodeCasterVirtualAudio.c)
@@ -77,14 +83,20 @@ typedef struct
 {
     const char *name;   // for log messages only
     const char *uid;    // must match kVirtualDevices[i].mUID in the driver
+    const char *key;    // short lowercase token: used as the line prefix in
+                         // state/rodevad-router.levels and as the config key
+                         // in config/channel-map.conf -- must match what the
+                         // GUI's ProjectLayout/ChannelMapStore/LevelsPoller
+                         // expect (see README "Levels file format" / "Channel
+                         // map config format").
 } VirtualDeviceIdentity;
 
 static const VirtualDeviceIdentity kVirtualDeviceIdentities[kNumberOfVirtualDevices] = {
-    { "RVAD System",    "com.abrendt.rodecastervad.system" },
-    { "RVAD Game",      "com.abrendt.rodecastervad.game" },
-    { "RVAD Music",     "com.abrendt.rodecastervad.music" },
-    { "RVAD Virtual A", "com.abrendt.rodecastervad.virtuala" },
-    { "RVAD Virtual B", "com.abrendt.rodecastervad.virtualb" }
+    { "RVAD System",    "com.abrendt.rodecastervad.system",    "system" },
+    { "RVAD Game",      "com.abrendt.rodecastervad.game",      "game" },
+    { "RVAD Music",     "com.abrendt.rodecastervad.music",     "music" },
+    { "RVAD Virtual A", "com.abrendt.rodecastervad.virtuala",  "virtuala" },
+    { "RVAD Virtual B", "com.abrendt.rodecastervad.virtualb",  "virtualb" }
 };
 
 #pragma mark - Channel mapping (OUR OWN GUESS -- see README "Known limitations")
@@ -101,12 +113,24 @@ typedef struct
     int firstChannel; // 0-based
 } ChannelMapping;
 
-static const ChannelMapping kChannelMap[kNumberOfVirtualDevices] = {
+// Compiled-in defaults. Used to seed the real, mutable sChannelMap[] below
+// (overridden at startup by config/channel-map.conf if present -- see
+// LoadChannelMapFromConfig), AND as RunSelfTest()'s own private, static
+// copy of the defaults so --selftest stays deterministic and
+// filesystem-independent regardless of what sChannelMap currently holds.
+static const ChannelMapping kDefaultChannelMap[kNumberOfVirtualDevices] = {
     { 0 }, // RVAD System    -> Multitrack channels 1-2
     { 2 }, // RVAD Game      -> Multitrack channels 3-4
     { 4 }, // RVAD Music     -> Multitrack channels 5-6
     { 6 }, // RVAD Virtual A -> Multitrack channels 7-8
     { 8 }  // RVAD Virtual B -> Multitrack channels 9-10
+};
+
+// The live, in-use channel mapping. Starts equal to kDefaultChannelMap;
+// LoadChannelMapFromConfig() may overwrite it once at startup (before any
+// IOProc is created) if config/channel-map.conf exists and is valid.
+static ChannelMapping sChannelMap[kNumberOfVirtualDevices] = {
+    { 0 }, { 2 }, { 4 }, { 6 }, { 8 }
 };
 
 #define kMultitrackChannelCount 10
@@ -247,6 +271,75 @@ static Boolean WriteStereoIntoBufferList(AudioBufferList *inList, int inFirstCha
     }
 
     return false;
+}
+
+#pragma mark - Level metering (pure float math -- exercised by --selftest)
+
+// Per-device level state, read by the levels-writer thread and by nothing
+// else. Plain atomics, no lock: HardwareIOProc (real-time thread) only
+// ever stores, the writer thread (ordinary POSIX thread) only ever loads.
+typedef struct
+{
+    _Atomic float mPeakL;
+    _Atomic float mPeakR;
+    _Atomic float mRMSL;
+    _Atomic float mRMSR;
+} LevelState;
+
+static LevelState sLevels[kNumberOfVirtualDevices];
+
+// Pure math: given the previous (already-decayed) peak values and one
+// block of interleaved stereo samples, computes this block's peak (with
+// cheap exponential decay carried over from the previous block) and RMS.
+// Factored out of the real-time callback specifically so --selftest can
+// exercise the exact metering math against fabricated buffers without
+// touching sLevels' atomics or any real IOProc. No allocation, no locks,
+// no syscalls -- safe to call from the real-time audio thread.
+static void ComputeLevelUpdate(Float32 inPrevPeakL, Float32 inPrevPeakR,
+                                const Float32 *inStereo, UInt32 inFrameCount,
+                                Float32 *outPeakL, Float32 *outPeakR,
+                                Float32 *outRMSL, Float32 *outRMSR)
+{
+    Float32 blockPeakL = 0.0f, blockPeakR = 0.0f;
+    double sumSqL = 0.0, sumSqR = 0.0;
+
+    for (UInt32 f = 0; f < inFrameCount; ++f)
+    {
+        Float32 l = inStereo[f * 2 + 0];
+        Float32 r = inStereo[f * 2 + 1];
+        Float32 absL = (l < 0.0f) ? -l : l;
+        Float32 absR = (r < 0.0f) ? -r : r;
+        if (absL > blockPeakL) blockPeakL = absL;
+        if (absR > blockPeakR) blockPeakR = absR;
+        sumSqL += (double)l * (double)l;
+        sumSqR += (double)r * (double)r;
+    }
+
+    // Cheap decay: each block, the carried-over peak fades by 15% before
+    // being compared against this block's own peak, so the meter falls
+    // off gradually after a transient instead of holding forever or
+    // snapping instantly to silence.
+    Float32 decayedPrevL = inPrevPeakL * 0.85f;
+    Float32 decayedPrevR = inPrevPeakR * 0.85f;
+    Float32 newPeakL = (decayedPrevL > blockPeakL) ? decayedPrevL : blockPeakL;
+    Float32 newPeakR = (decayedPrevR > blockPeakR) ? decayedPrevR : blockPeakR;
+
+    Float32 rmsL = (inFrameCount > 0) ? (Float32)sqrt(sumSqL / (double)inFrameCount) : 0.0f;
+    Float32 rmsR = (inFrameCount > 0) ? (Float32)sqrt(sumSqR / (double)inFrameCount) : 0.0f;
+
+    // Clamp to [0,1] -- see README "Levels file format": consumers should
+    // never have to defend against out-of-range values from this file.
+    if (newPeakL > 1.0f) newPeakL = 1.0f;
+    if (newPeakR > 1.0f) newPeakR = 1.0f;
+    if (newPeakL < 0.0f) newPeakL = 0.0f;
+    if (newPeakR < 0.0f) newPeakR = 0.0f;
+    if (rmsL > 1.0f) rmsL = 1.0f;
+    if (rmsR > 1.0f) rmsR = 1.0f;
+
+    *outPeakL = newPeakL;
+    *outPeakR = newPeakR;
+    *outRMSL = rmsL;
+    *outRMSR = rmsR;
 }
 
 #pragma mark - Device discovery helpers
@@ -439,6 +532,21 @@ static OSStatus HardwareIOProc(AudioObjectID inDevice, const AudioTimeStamp *inN
     for (int d = 0; d < kNumberOfVirtualDevices; ++d)
     {
         RingBufferPop(ctx->mRings[d], ctx->mScratch, frameCount);
+
+        // Level metering reflects the actual post-mix signal (i.e. what
+        // just came out of this device's ring buffer, the same samples
+        // about to be written to hardware) -- computed right here, not
+        // earlier in VirtualDeviceIOProc, so the GUI's meters show what's
+        // really reaching the Multitrack device.
+        Float32 prevPeakL = atomic_load_explicit(&sLevels[d].mPeakL, memory_order_relaxed);
+        Float32 prevPeakR = atomic_load_explicit(&sLevels[d].mPeakR, memory_order_relaxed);
+        Float32 peakL, peakR, rmsL, rmsR;
+        ComputeLevelUpdate(prevPeakL, prevPeakR, ctx->mScratch, frameCount, &peakL, &peakR, &rmsL, &rmsR);
+        atomic_store_explicit(&sLevels[d].mPeakL, peakL, memory_order_relaxed);
+        atomic_store_explicit(&sLevels[d].mPeakR, peakR, memory_order_relaxed);
+        atomic_store_explicit(&sLevels[d].mRMSL, rmsL, memory_order_relaxed);
+        atomic_store_explicit(&sLevels[d].mRMSR, rmsR, memory_order_relaxed);
+
         Boolean ok = WriteStereoIntoBufferList(outOutputData, ctx->mFirstChannel[d], ctx->mScratch, frameCount);
         if (!ok && !ctx->mWarnedLayout[d])
         {
@@ -451,6 +559,197 @@ static OSStatus HardwareIOProc(AudioObjectID inDevice, const AudioTimeStamp *inN
     }
 
     return noErr;
+}
+
+#pragma mark - Runtime channel-map config (config/channel-map.conf)
+
+// Reads inPath if it exists, parsing `key=value` lines (blank lines and
+// lines starting with # are skipped -- see daemon/channel-map.example.conf
+// for the documented format). On success, overwrites outMap (in
+// kVirtualDeviceIdentities order) and returns true. This is called once
+// at startup, before any IOProc exists, so there's no real-time-safety
+// concern here -- ordinary blocking file IO is fine.
+//
+//   - Missing file: NOT an error. Prints one informational line and
+//     returns true with outMap left untouched (caller is expected to have
+//     already seeded it with the compiled-in defaults).
+//   - Present but invalid (parse error, bad range, missing key, duplicate
+//     key, or overlapping channel pairs): prints one specific error
+//     naming the exact problem and returns false. The caller must refuse
+//     to start rather than run with a partially-trusted mapping -- same
+//     fail-loudly philosophy this file already uses for sample-rate/
+//     format mismatches.
+static Boolean LoadChannelMapFromConfig(const char *inPath, ChannelMapping outMap[kNumberOfVirtualDevices])
+{
+    FILE *f = fopen(inPath, "r");
+    if (f == NULL)
+    {
+        printf("rodevad-router: no %s found, using the compiled-in default channel mapping.\n", inPath);
+        return true;
+    }
+
+    int parsedValue[kNumberOfVirtualDevices];
+    Boolean seen[kNumberOfVirtualDevices];
+    for (int i = 0; i < kNumberOfVirtualDevices; ++i) { parsedValue[i] = 0; seen[i] = false; }
+
+    char line[256];
+    int lineNo = 0;
+    while (fgets(line, sizeof(line), f) != NULL)
+    {
+        lineNo++;
+
+        size_t len = strlen(line);
+        while (len > 0 && isspace((unsigned char)line[len - 1])) line[--len] = '\0';
+
+        char *p = line;
+        while (*p != '\0' && isspace((unsigned char)*p)) p++;
+        if (*p == '\0' || *p == '#') continue; // blank line or comment
+
+        char *eq = strchr(p, '=');
+        if (eq == NULL)
+        {
+            fprintf(stderr, "rodevad-router: ERROR - %s line %d: expected \"key=value\", got \"%s\"\n", inPath, lineNo, p);
+            fclose(f);
+            return false;
+        }
+        *eq = '\0';
+        char *keyStr = p;
+        char *valStr = eq + 1;
+
+        int deviceIdx = -1;
+        for (int i = 0; i < kNumberOfVirtualDevices; ++i)
+        {
+            if (strcmp(keyStr, kVirtualDeviceIdentities[i].key) == 0) { deviceIdx = i; break; }
+        }
+        if (deviceIdx < 0)
+        {
+            fprintf(stderr, "rodevad-router: ERROR - %s line %d: unknown device key \"%s\" (expected one of "
+                            "system/game/music/virtuala/virtualb)\n", inPath, lineNo, keyStr);
+            fclose(f);
+            return false;
+        }
+        if (seen[deviceIdx])
+        {
+            fprintf(stderr, "rodevad-router: ERROR - %s line %d: device key \"%s\" specified more than once\n", inPath, lineNo, keyStr);
+            fclose(f);
+            return false;
+        }
+
+        char *endPtr = NULL;
+        long value = strtol(valStr, &endPtr, 10);
+        if (endPtr == valStr || *endPtr != '\0')
+        {
+            fprintf(stderr, "rodevad-router: ERROR - %s line %d: value for \"%s\" is not a plain integer: \"%s\"\n", inPath, lineNo, keyStr, valStr);
+            fclose(f);
+            return false;
+        }
+        if (value < 1 || value > 9)
+        {
+            fprintf(stderr, "rodevad-router: ERROR - %s line %d: \"%s=%ld\" is out of range -- must be 1-9 "
+                            "(each device occupies channel N and N+1, and the Multitrack device has %d channels)\n",
+                    inPath, lineNo, keyStr, value, kMultitrackChannelCount);
+            fclose(f);
+            return false;
+        }
+
+        parsedValue[deviceIdx] = (int)value;
+        seen[deviceIdx] = true;
+    }
+    fclose(f);
+
+    for (int i = 0; i < kNumberOfVirtualDevices; ++i)
+    {
+        if (!seen[i])
+        {
+            fprintf(stderr, "rodevad-router: ERROR - %s is missing required key \"%s\"\n", inPath, kVirtualDeviceIdentities[i].key);
+            return false;
+        }
+    }
+
+    // Reject any two devices whose 1-based [value, value+1] stereo pairs
+    // overlap.
+    for (int a = 0; a < kNumberOfVirtualDevices; ++a)
+    {
+        int aStart = parsedValue[a], aEnd = aStart + 1;
+        for (int b = a + 1; b < kNumberOfVirtualDevices; ++b)
+        {
+            int bStart = parsedValue[b], bEnd = bStart + 1;
+            if (aStart <= bEnd && bStart <= aEnd)
+            {
+                fprintf(stderr, "rodevad-router: ERROR - %s: device \"%s\" (channels %d-%d) overlaps device \"%s\" (channels %d-%d)\n",
+                        inPath, kVirtualDeviceIdentities[a].key, aStart, aEnd,
+                        kVirtualDeviceIdentities[b].key, bStart, bEnd);
+                return false;
+            }
+        }
+    }
+
+    for (int i = 0; i < kNumberOfVirtualDevices; ++i)
+    {
+        outMap[i].firstChannel = parsedValue[i] - 1; // 1-based file value -> 0-based internal representation
+    }
+
+    printf("rodevad-router: loaded channel mapping from %s\n", inPath);
+    return true;
+}
+
+#pragma mark - Levels file writer thread (state/rodevad-router.levels)
+
+#define kLevelsFilePath "state/rodevad-router.levels"
+#define kLevelsFileTmpPath "state/rodevad-router.levels.tmp"
+#define kLevelsWriteIntervalUsec 75000 // ~75ms
+
+static pthread_t sLevelsWriterThread;
+static volatile sig_atomic_t sLevelsWriterShouldStop = 0;
+
+// Ordinary POSIX thread (not real-time) that periodically snapshots
+// sLevels into state/rodevad-router.levels. Writes to a .tmp file first
+// and rename()s over the real path so any reader (the GUI) only ever sees
+// a complete, consistent file -- rename() is atomic on the same volume,
+// so there's no window where the file is half-written.
+static void *LevelsWriterThreadMain(void *inArg)
+{
+    (void)inArg;
+
+    while (!sLevelsWriterShouldStop)
+    {
+        char buf[1024];
+        int offset = 0;
+
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        double timestamp = (double)ts.tv_sec + (double)ts.tv_nsec / 1.0e9;
+
+        offset += snprintf(buf + offset, sizeof(buf) - (size_t)offset, "version=1\n");
+        offset += snprintf(buf + offset, sizeof(buf) - (size_t)offset, "timestamp=%.3f\n", timestamp);
+
+        for (int d = 0; d < kNumberOfVirtualDevices; ++d)
+        {
+            float peakL = atomic_load_explicit(&sLevels[d].mPeakL, memory_order_relaxed);
+            float peakR = atomic_load_explicit(&sLevels[d].mPeakR, memory_order_relaxed);
+            float rmsL = atomic_load_explicit(&sLevels[d].mRMSL, memory_order_relaxed);
+            float rmsR = atomic_load_explicit(&sLevels[d].mRMSR, memory_order_relaxed);
+            offset += snprintf(buf + offset, sizeof(buf) - (size_t)offset,
+                                "%s peakL=%.3f peakR=%.3f rmsL=%.3f rmsR=%.3f\n",
+                                kVirtualDeviceIdentities[d].key, (double)peakL, (double)peakR, (double)rmsL, (double)rmsR);
+        }
+
+        FILE *f = fopen(kLevelsFileTmpPath, "w");
+        if (f != NULL)
+        {
+            fwrite(buf, 1, (size_t)offset, f);
+            fclose(f);
+            rename(kLevelsFileTmpPath, kLevelsFilePath);
+        }
+        // If state/ doesn't exist or isn't writable, silently skip this
+        // round rather than spamming the log every 75ms -- main() already
+        // mkdir()s state/ at startup, so this should only happen if
+        // something external removed it while running.
+
+        usleep(kLevelsWriteIntervalUsec);
+    }
+
+    return NULL;
 }
 
 #pragma mark - Self-test (pure buffer math, no device IO -- safe to run any time)
@@ -552,7 +851,7 @@ static int RunSelfTest(void)
                 src[f * 2 + 0] = (Float32)(d * 100 + f * 2 + 1); // distinct per-device pattern
                 src[f * 2 + 1] = (Float32)(d * 100 + f * 2 + 2);
             }
-            if (!WriteStereoIntoBufferList(&list, kChannelMap[d].firstChannel, src, frameCount)) allOK = false;
+            if (!WriteStereoIntoBufferList(&list, kDefaultChannelMap[d].firstChannel, src, frameCount)) allOK = false;
         }
 
         Boolean valuesCorrect = true;
@@ -562,8 +861,8 @@ static int RunSelfTest(void)
             {
                 Float32 expectedL = (Float32)(d * 100 + f * 2 + 1);
                 Float32 expectedR = (Float32)(d * 100 + f * 2 + 2);
-                Float32 gotL = dest[f * kMultitrackChannelCount + kChannelMap[d].firstChannel + 0];
-                Float32 gotR = dest[f * kMultitrackChannelCount + kChannelMap[d].firstChannel + 1];
+                Float32 gotL = dest[f * kMultitrackChannelCount + kDefaultChannelMap[d].firstChannel + 0];
+                Float32 gotR = dest[f * kMultitrackChannelCount + kDefaultChannelMap[d].firstChannel + 1];
                 if (gotL != expectedL || gotR != expectedR) valuesCorrect = false;
             }
         }
@@ -602,7 +901,7 @@ static int RunSelfTest(void)
 
         int deviceIdx = 2; // "RVAD Music" -> channels 5-6 (0-based 4,5)
         Float32 src[4 * 2] = { 11, 21, 12, 22, 13, 23, 14, 24 };
-        Boolean wrote = WriteStereoIntoBufferList(list, kChannelMap[deviceIdx].firstChannel, src, frameCount);
+        Boolean wrote = WriteStereoIntoBufferList(list, kDefaultChannelMap[deviceIdx].firstChannel, src, frameCount);
 
         Boolean valuesCorrect = true;
         for (UInt32 f = 0; f < frameCount; ++f)
@@ -656,6 +955,152 @@ static int RunSelfTest(void)
         }
     }
 
+    // --- Test 7: level metering math (ComputeLevelUpdate) -- pure float math, no atomics/devices ---
+    {
+        // Silence in -> silence out, starting from silence.
+        Float32 silence[4 * 2] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+        Float32 peakL, peakR, rmsL, rmsR;
+        ComputeLevelUpdate(0.0f, 0.0f, silence, 4, &peakL, &peakR, &rmsL, &rmsR);
+        Boolean silenceOK = (peakL == 0.0f && peakR == 0.0f && rmsL == 0.0f && rmsR == 0.0f);
+
+        // A full-scale square-wave-ish block: peak should be 1.0, and RMS
+        // of a constant +-1.0 signal is exactly 1.0.
+        Float32 loud[4 * 2] = { 1, -1, 1, -1, 1, -1, 1, -1 };
+        ComputeLevelUpdate(0.0f, 0.0f, loud, 4, &peakL, &peakR, &rmsL, &rmsR);
+        Boolean loudOK = (peakL == 1.0f && peakR == 1.0f &&
+                           fabsf(rmsL - 1.0f) < 0.0001f && fabsf(rmsR - 1.0f) < 0.0001f);
+
+        // Decay: starting from a previous peak of 1.0 with a silent block,
+        // the new peak should be exactly 0.85 (1.0 * the documented 0.85
+        // decay factor), not instantly 0 and not still 1.0.
+        ComputeLevelUpdate(1.0f, 1.0f, silence, 4, &peakL, &peakR, &rmsL, &rmsR);
+        Boolean decayOK = (fabsf(peakL - 0.85f) < 0.0001f && fabsf(peakR - 0.85f) < 0.0001f &&
+                            rmsL == 0.0f && rmsR == 0.0f);
+
+        // Clamping: a block with an out-of-nominal-range sample (e.g. a
+        // clipped/hot signal above 1.0) must never produce a peak/RMS
+        // above 1.0 in the output.
+        Float32 hot[2 * 2] = { 3.5f, -3.5f, 3.5f, -3.5f };
+        ComputeLevelUpdate(0.0f, 0.0f, hot, 2, &peakL, &peakR, &rmsL, &rmsR);
+        Boolean clampOK = (peakL <= 1.0f && peakR <= 1.0f && rmsL <= 1.0f && rmsR <= 1.0f);
+
+        if (!silenceOK || !loudOK || !decayOK || !clampOK)
+        {
+            fprintf(stderr, "SELFTEST FAIL: level metering math incorrect (silence=%d loud=%d decay=%d clamp=%d)\n",
+                    silenceOK, loudOK, decayOK, clampOK);
+            failures++;
+        }
+        else
+        {
+            printf("SELFTEST OK: level metering math (silence/peak/RMS/decay/clamping) correct\n");
+        }
+    }
+
+    // --- Test 8: LoadChannelMapFromConfig -- valid and invalid configs ---
+    // Uses temp files under the system temp directory (mkstemp), NOT this
+    // project's real config/channel-map.conf, so this can never affect a
+    // live-running daemon's config. Still "no device IO" in the sense that
+    // matters for this doc comment's safety contract -- no CoreAudio
+    // device is touched, only ordinary temp-file parsing.
+    {
+        char tmpPath[] = "/tmp/rodevad-router-selftest-XXXXXX";
+        int fd = mkstemp(tmpPath);
+        Boolean testOK = true;
+
+        if (fd < 0)
+        {
+            fprintf(stderr, "SELFTEST FAIL: could not create temp file for channel-map config test (errno=%d)\n", errno);
+            failures++;
+        }
+        else
+        {
+            close(fd);
+
+            // --- 8a: missing file -> not an error, returns true, map untouched ---
+            unlink(tmpPath); // ensure it doesn't exist
+            ChannelMapping mapMissing[kNumberOfVirtualDevices];
+            memcpy(mapMissing, kDefaultChannelMap, sizeof(mapMissing));
+            Boolean missingResult = LoadChannelMapFromConfig(tmpPath, mapMissing);
+            if (!missingResult)
+            {
+                fprintf(stderr, "SELFTEST FAIL: LoadChannelMapFromConfig should return true (not an error) for a missing file\n");
+                testOK = false;
+            }
+
+            // --- 8b: valid config -> parses correctly, exact expected values ---
+            FILE *fValid = fopen(tmpPath, "w");
+            // Non-overlapping, deliberately permuted (not the compiled-in
+            // default order) so this proves real parsing, not just an
+            // accidental match against defaults: system[3-4], game[5-6],
+            // music[7-8], virtuala[9-10], virtualb[1-2].
+            fprintf(fValid, "# comment line, and a blank line follow\n\n"
+                             "system=3\ngame=5\nmusic=7\nvirtuala=9\nvirtualb=1\n");
+            fclose(fValid);
+            ChannelMapping mapValid[kNumberOfVirtualDevices];
+            memset(mapValid, 0, sizeof(mapValid));
+            Boolean validResult = LoadChannelMapFromConfig(tmpPath, mapValid);
+            Boolean validValuesOK = validResult &&
+                mapValid[0].firstChannel == 2 && // system=3   -> 0-based 2
+                mapValid[1].firstChannel == 4 && // game=5     -> 0-based 4
+                mapValid[2].firstChannel == 6 && // music=7    -> 0-based 6
+                mapValid[3].firstChannel == 8 && // virtuala=9 -> 0-based 8
+                mapValid[4].firstChannel == 0;   // virtualb=1 -> 0-based 0
+            if (!validValuesOK)
+            {
+                fprintf(stderr, "SELFTEST FAIL: LoadChannelMapFromConfig did not parse a valid config correctly\n");
+                testOK = false;
+            }
+
+            // --- 8c: overlapping pairs -> rejected ---
+            FILE *fOverlap = fopen(tmpPath, "w");
+            fprintf(fOverlap, "system=1\ngame=2\nmusic=5\nvirtuala=7\nvirtualb=9\n"); // system(1-2) overlaps game(2-3)
+            fclose(fOverlap);
+            ChannelMapping mapOverlap[kNumberOfVirtualDevices];
+            Boolean overlapResult = LoadChannelMapFromConfig(tmpPath, mapOverlap);
+            if (overlapResult)
+            {
+                fprintf(stderr, "SELFTEST FAIL: LoadChannelMapFromConfig should reject overlapping channel pairs\n");
+                testOK = false;
+            }
+
+            // --- 8d: out-of-range value -> rejected ---
+            FILE *fRange = fopen(tmpPath, "w");
+            fprintf(fRange, "system=1\ngame=3\nmusic=5\nvirtuala=7\nvirtualb=10\n"); // 10 is out of the 1-9 range
+            fclose(fRange);
+            ChannelMapping mapRange[kNumberOfVirtualDevices];
+            Boolean rangeResult = LoadChannelMapFromConfig(tmpPath, mapRange);
+            if (rangeResult)
+            {
+                fprintf(stderr, "SELFTEST FAIL: LoadChannelMapFromConfig should reject an out-of-range channel value\n");
+                testOK = false;
+            }
+
+            // --- 8e: missing a required key -> rejected ---
+            FILE *fShort = fopen(tmpPath, "w");
+            fprintf(fShort, "system=1\ngame=3\nmusic=5\nvirtuala=7\n"); // virtualb missing entirely
+            fclose(fShort);
+            ChannelMapping mapShort[kNumberOfVirtualDevices];
+            Boolean shortResult = LoadChannelMapFromConfig(tmpPath, mapShort);
+            if (shortResult)
+            {
+                fprintf(stderr, "SELFTEST FAIL: LoadChannelMapFromConfig should reject a config missing a required key\n");
+                testOK = false;
+            }
+
+            unlink(tmpPath);
+
+            if (testOK)
+            {
+                printf("SELFTEST OK: LoadChannelMapFromConfig accepts missing/valid configs and rejects "
+                       "overlapping/out-of-range/incomplete ones\n");
+            }
+            else
+            {
+                failures++;
+            }
+        }
+    }
+
     if (failures == 0)
     {
         printf("SELFTEST: ALL CHECKS PASSED\n");
@@ -703,7 +1148,44 @@ int main(int argc, char **argv)
     signal(SIGINT, HandleStopSignal);
     signal(SIGTERM, HandleStopSignal);
 
+    /* stdout is fully-buffered (not line-buffered) when redirected to a file,
+     * as it is under launchd -- without this, log lines sit in the buffer
+     * indefinitely instead of reaching the log file promptly. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     printf("rodevad-router starting (pid %d)\n", getpid());
+
+    // state/ holds the levels file this process writes; config/ holds the
+    // optional channel-map override this process reads. Both are relative
+    // to the current working directory, which is why the LaunchAgent plist
+    // sets WorkingDirectory to this project's root (see
+    // daemon/com.abrendt.rodevad.router.plist) -- so these paths resolve
+    // the same way whether run manually from the project root or via
+    // launchd. mkdir() failing with EEXIST is expected and fine; anything
+    // else is logged but not fatal (the levels writer thread already
+    // tolerates state/ being unwritable by silently skipping a write).
+    if (mkdir("state", 0755) != 0 && errno != EEXIST)
+    {
+        fprintf(stderr, "rodevad-router: warning - could not create state/ (errno=%d) -- level meters will not be available\n", errno);
+    }
+    if (mkdir("config", 0755) != 0 && errno != EEXIST)
+    {
+        fprintf(stderr, "rodevad-router: warning - could not create config/ (errno=%d)\n", errno);
+    }
+
+    // Load the channel mapping before touching any device/IOProc. sChannelMap
+    // already holds the compiled-in defaults; this only overwrites it if
+    // config/channel-map.conf is present AND valid. An invalid (present but
+    // malformed) file is fatal -- LoadChannelMapFromConfig already printed
+    // the specific reason.
+    if (!LoadChannelMapFromConfig("config/channel-map.conf", sChannelMap))
+    {
+        fprintf(stderr, "rodevad-router: ERROR - refusing to start with an invalid channel-map config. Fix "
+                        "config/channel-map.conf (see daemon/channel-map.example.conf for the format) or remove "
+                        "it to fall back to defaults.\n");
+        return 1;
+    }
+
     printf("rodevad-router: waiting for the 5 RVAD virtual devices and the RODECaster Pro II Main Multitrack device...\n");
 
     AudioDeviceID theVirtualDeviceIDs[kNumberOfVirtualDevices];
@@ -863,7 +1345,7 @@ int main(int argc, char **argv)
     for (int i = 0; i < kNumberOfVirtualDevices; ++i)
     {
         sHWContext.mRings[i] = &sRings[i];
-        sHWContext.mFirstChannel[i] = kChannelMap[i].firstChannel;
+        sHWContext.mFirstChannel[i] = sChannelMap[i].firstChannel;
     }
 
     AudioDeviceIOProcID theHWProcID = NULL;
@@ -884,8 +1366,24 @@ int main(int argc, char **argv)
     for (int i = 0; i < kNumberOfVirtualDevices; ++i)
     {
         printf("  %-15s -> Multitrack channels %d-%d\n", kVirtualDeviceIdentities[i].name,
-               kChannelMap[i].firstChannel + 1, kChannelMap[i].firstChannel + 2);
+               sChannelMap[i].firstChannel + 1, sChannelMap[i].firstChannel + 2);
     }
+
+    // Start the levels-writer thread only now that every IOProc is
+    // actually running (so sLevels has real data to write instead of
+    // zeros from the moment the thread starts).
+    int threadStatus = pthread_create(&sLevelsWriterThread, NULL, LevelsWriterThreadMain, NULL);
+    Boolean levelsWriterStarted = (threadStatus == 0);
+    if (!levelsWriterStarted)
+    {
+        fprintf(stderr, "rodevad-router: warning - could not start the levels-writer thread (pthread_create "
+                        "status=%d) -- level meters will not be available, routing is unaffected.\n", threadStatus);
+    }
+    else
+    {
+        printf("rodevad-router: writing live levels to %s every ~%dms\n", kLevelsFilePath, kLevelsWriteIntervalUsec / 1000);
+    }
+
     printf("rodevad-router: press Ctrl-C (or send SIGTERM) to stop.\n");
 
     while (!gShouldStop)
@@ -902,6 +1400,16 @@ int main(int argc, char **argv)
     {
         AudioDeviceStop(theVirtualDeviceIDs[i], theVirtualProcIDs[i]);
         AudioDeviceDestroyIOProcID(theVirtualDeviceIDs[i], theVirtualProcIDs[i]);
+    }
+
+    // Join the levels-writer thread only after every IOProc has been
+    // stopped/destroyed -- nothing is updating sLevels anymore at this
+    // point, so it's safe to let the writer finish its current cycle and
+    // exit rather than yanking it out mid-write.
+    if (levelsWriterStarted)
+    {
+        sLevelsWriterShouldStop = 1;
+        pthread_join(sLevelsWriterThread, NULL);
     }
 
     printf("rodevad-router: stopped cleanly.\n");

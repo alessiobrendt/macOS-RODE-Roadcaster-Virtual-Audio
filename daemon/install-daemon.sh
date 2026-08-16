@@ -65,13 +65,14 @@ fi
 echo "==> Running offline self-test one more time before installing..."
 "$ROUTER_BIN" --selftest
 
-mkdir -p "$LOG_DIR"
+mkdir -p "$LOG_DIR" "$PROJECT_DIR/state" "$PROJECT_DIR/config"
 
 echo "==> Writing $DEST_PLIST"
 mkdir -p "$HOME/Library/LaunchAgents"
 sed -e "s#__ROUTER_BIN_PATH__#${ROUTER_BIN}#g" \
     -e "s#__STDOUT_LOG__#${STDOUT_LOG}#g" \
     -e "s#__STDERR_LOG__#${STDERR_LOG}#g" \
+    -e "s#__WORKING_DIR__#${PROJECT_DIR}#g" \
     "$TEMPLATE_PLIST" > "$DEST_PLIST"
 
 plutil -lint "$DEST_PLIST"

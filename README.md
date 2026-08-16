@@ -362,24 +362,30 @@ scraping the human-readable `--list` table.
 ### GUI
 
 For clicking buttons instead of typing commands, there's a small native
-SwiftUI app, **RodeCaster VAD Tester**, under `gui/RodeVADTester/`. It's a
-thin GUI wrapper around the same `testtone` binary described above -- it
-does not reimplement audio playback -- so it shares exactly the same
-tested, verified playback path; it just gives you a device picker and one
-"Play" button per channel instead of a terminal.
+SwiftUI app, **RodeCaster VAD Tester**, under `gui/RodeVADTester/`. It has
+grown from a single test-tone panel into the full control surface for this
+project: 5 tabs -- **Dashboard**, **Channel Test**, **Levels**, **Channel
+Mapping**, and **Daemon** -- all sharing one live app state
+(`AppShellView` owns `DeviceStore`, `DaemonController`, and
+`ChannelMapStore` as `@StateObject`s, injected into every tab via
+`.environmentObject`). It never reimplements audio playback or CoreAudio
+device enumeration in Swift: every "Play" button still shells out to the
+already-verified `testtone` binary, and the Dashboard/Channel Test tabs
+still read device info via `testtone --list-machine`.
 
-Build it (implies `make testtone` first, since the GUI shells out to it):
+Build it (implies `make testtone daemon` first, since the GUI shells out to
+both binaries):
 
 ```
 make gui
 ```
 
-This runs `swift build` (Swift Package Manager, no Xcode.app required --
-only the Command Line Tools' Swift toolchain) and hand-assembles the result
-into `build/RodeVADTester.app`, then runs the same style of verification as
-the driver bundle: `plutil -lint` on its `Info.plist`, ad-hoc `codesign`,
-and an `otool -L` check that the executable actually links
-`SwiftUI`/`AppKit`.
+This runs `swift build` (Swift Package Manager, no Xcode.app or `#Preview`
+required -- only the Command Line Tools' Swift toolchain) and
+hand-assembles the result into `build/RodeVADTester.app`, then runs the
+same style of verification as the driver bundle: `plutil -lint` on its
+`Info.plist`, ad-hoc `codesign`, and an `otool -L` check that the
+executable actually links `SwiftUI`/`AppKit`.
 
 Launch it:
 
@@ -388,30 +394,68 @@ open build/RodeVADTester.app
 ```
 
 or run the executable directly to see console output/errors:
+`./build/RodeVADTester.app/Contents/MacOS/RodeVADTester`.
 
-```
-./build/RodeVADTester.app/Contents/MacOS/RodeVADTester
-```
+**Dashboard** -- at-a-glance status, no polling of its own: HAL driver
+installed (`HALDriverCheck`, a one-line `FileManager` existence check
+against `/Library/Audio/Plug-Ins/HAL/RodeCasterVirtualAudio.driver` --
+strictly read-only, no install/uninstall action anywhere in this app),
+RodeCaster Multitrack device connected (`DeviceStore.multitrackDevice`,
+matched by UID substring `"RODECaster Pro II"`, the same convention the
+daemon itself uses), all 5 `RVAD *` devices visible
+(`DeviceStore.rvadDeviceCount`), and daemon status (from `DaemonController`,
+which is already polling while this tab is open).
 
-What it does:
-- On launch (and via the **Refresh** button), runs
-  `./build/testtone --list-machine` next to the app bundle and populates a
-  device picker, defaulting to "RVAD System" if it's present (otherwise the
-  first device in the list). All 5 `RVAD *` devices show up once the driver
-  is installed.
-- Once a device is selected, shows one row per output channel (channel
-  count comes straight from that device -- 2 per `RVAD *` device by
-  default, but it works for any device with any channel count, e.g. the
-  RodeCaster Pro 2's own 10-channel "Main Multitrack" USB stream).
-- Each row's **Play** button runs
-  `./build/testtone --device <uid> --channel <n> --duration <n>` as a
-  subprocess (selecting the device by its stable UID, not by name/index,
-  to avoid any ambiguity), shows "Playing channel N..." while it runs, and
-  disables that row's button until it finishes (so you can't overlap two
-  calls to the same channel). A stepper lets you adjust the tone length
-  (0.5-5.0s, default 1.5s) before pressing Play.
-- The app is not installed anywhere system-wide -- it stays in `build/`
-  alongside `testtone` and the driver bundle.
+**Channel Test** -- the original per-channel test-tone panel (renamed from
+`ContentView`/"RodeCaster Virtual Audio — Channel Tester" to
+`ChannelTesterView`/"Channel Test"), unchanged in behavior.
+
+**Levels** -- live per-channel meters for all 5 devices (L/R, RMS fill +
+peak marker, color ramps green→yellow→red), reading
+`state/rodevad-router.levels` roughly 8x/second via `LevelsPoller`, which
+is deliberately *not* shared app-wide: it only polls while this tab is
+visible (`start()`/`stop()` in `onAppear`/`onDisappear`), not for the
+app's whole lifetime. Shows an explicit "no live data" banner instead of
+frozen/stale-looking bars when the daemon isn't running or hasn't updated
+recently (timestamp older than 1s, or the file is missing/unparseable).
+This is for "is there signal, roughly how hot" sanity-checking, not
+broadcast-grade metering.
+
+**Channel Mapping** -- 5 steppers (1-9) for each device's starting
+Multitrack channel, with inline red highlighting on any overlapping pair.
+Loads `config/channel-map.conf` if present, else falls back to
+`daemon/channel-map.example.conf` as a starting template. Client-side
+validation mirrors the daemon's own range/overlap rules purely for instant
+UX feedback -- **the daemon re-validates the saved file itself and refuses
+to start on bad input; that's the real safety authority, not this UI**.
+"Apply (restarts daemon)" is the *only* way a change takes effect (save →
+stop → start, in that order, surfacing each step's progress/errors) --
+there is no live-reload/SIGHUP path in this round, and the button is
+disabled whenever there are no unsaved changes or the current values don't
+validate.
+
+**Daemon** -- Start/Stop buttons calling `DaemonController.start()`/`stop()`,
+which shell out to the exact same `daemon/install-daemon.sh` /
+`daemon/uninstall-daemon.sh` scripts described below (both scripts have no
+interactive prompts, confirmed safe to drive via a plain `Process` with no
+PTY). Status is a **heuristic**, not a state machine: PID present via
+`launchctl list <label>` → running; PID absent + no recent `ERROR` in the
+logs → probably still waiting for devices; PID absent + a recent `ERROR`
+line → that line is surfaced directly. `launchctl`'s text output format is
+informal and undocumented, so **the raw log tail is always shown alongside
+the derived status, never hidden behind it** -- judge for yourself rather
+than trusting the heuristic blindly.
+
+A pink heart **Donate** button lives in the toolbar (opens
+`https://www.paypal.com/paypalme/alessiobrendt` via `NSWorkspace`) --
+unobtrusive, never gates any functionality.
+
+The app is not installed anywhere system-wide -- it stays in `build/`
+alongside `testtone` and `rodevad-router`. `ProjectLayout.swift` is now the
+single source of truth for every path the GUI touches (project root,
+`build/`, `logs/`, `state/`, `config/`, the daemon scripts); other files
+that used to each do their own path-walking (`TestToneLocator`) now
+delegate to it.
 
 ## Routing daemon
 
@@ -445,18 +489,90 @@ RØDE's own background daemon in their (broken) official driver.
    a small per-device lock-free ring buffer (plain atomics, no mutex, no
    allocation -- safe to touch from a real-time audio thread).
 4. **A single IOProc on the Multitrack hardware device** pops from all 5
-   ring buffers every hardware IO cycle and writes each one into its
-   assigned 2-channel slice of the Multitrack device's interleaved
-   10-channel output, per the channel mapping table in "5-device
-   architecture" above (`kChannelMap[]` in the source -- a simple constant
-   table, deliberately easy to edit if the mapping needs to change).
-   Handles both the "one big 10-channel interleaved buffer" and "10
-   separate mono buffers" `AudioBufferList` layouts a real device might
-   present; if neither pattern matches, it logs a specific error once (not
-   spammed every callback) instead of corrupting memory or guessing.
+   ring buffers every hardware IO cycle, computes each device's level
+   (peak with cheap exponential decay + RMS -- see "Live level meters"
+   below) right there so it reflects the actual post-mix signal, and
+   writes each one into its assigned 2-channel slice of the Multitrack
+   device's interleaved 10-channel output, per the current channel mapping
+   (`sChannelMap[]` in the source -- mutable at startup, see "Runtime
+   channel mapping" below). Handles both the "one big 10-channel
+   interleaved buffer" and "10 separate mono buffers" `AudioBufferList`
+   layouts a real device might present; if neither pattern matches, it
+   logs a specific error once (not spammed every callback) instead of
+   corrupting memory or guessing.
 5. **Cleans up properly on exit**: SIGINT/SIGTERM (Ctrl-C, or
-   `launchctl unload`) stops and destroys all 6 IOProcs before exiting, so
-   it never leaves the RodeCaster or the virtual devices in a stuck state.
+   `launchctl unload`) stops and destroys all 6 IOProcs, then joins the
+   levels-writer thread (see below), before exiting -- so it never leaves
+   the RodeCaster, the virtual devices, or that background thread in a
+   stuck state.
+
+### Live level meters (state/rodevad-router.levels)
+
+A plain POSIX writer thread (not a real-time audio thread -- an ordinary
+`pthread_create`d thread, started only once every IOProc is already
+running) rewrites `state/rodevad-router.levels` roughly every 75ms: format
+into a stack buffer, write to a `.tmp` file, `rename()` over the real
+path. `rename()` is atomic on the same volume, so a reader (the GUI's
+`LevelsPoller`) never sees a half-written file. The level *values*
+themselves are computed inside the real-time `HardwareIOProc` using only
+plain float math -- no allocation, no locks, no syscalls -- and handed off
+to the writer thread via a small array of C11 atomics (`_Atomic float`,
+`memory_order_relaxed`); the writer thread does the actual (blocking)
+file IO, which would never be safe to do on the audio callback thread
+itself.
+
+Format (fixed device-line order matching `kVirtualDeviceIdentities`,
+values clamped to `[0,1]`, `timestamp` lets a reader detect staleness):
+
+```
+version=1
+timestamp=1755364821.123
+system peakL=0.482 peakR=0.451 rmsL=0.201 rmsR=0.190
+game peakL=0.000 peakR=0.000 rmsL=0.000 rmsR=0.000
+music peakL=0.912 peakR=0.885 rmsL=0.430 rmsR=0.410
+virtuala peakL=0.010 peakR=0.011 rmsL=0.004 rmsR=0.004
+virtualb peakL=0.000 peakR=0.000 rmsL=0.000 rmsR=0.000
+```
+
+If `state/` doesn't exist or isn't writable, the writer thread silently
+skips that round rather than spamming the log every 75ms (`mkdir("state",
+0755)` at startup should make this a non-issue in normal operation).
+
+### Runtime channel mapping (config/channel-map.conf)
+
+The channel mapping described in "5-device architecture" above is no
+longer purely compile-time: `LoadChannelMapFromConfig` reads
+`config/channel-map.conf` once at startup, **before any IOProc is
+created**, and overrides the compiled-in defaults (`kDefaultChannelMap[]`)
+if the file is present and valid. See `daemon/channel-map.example.conf`
+for the documented format and defaults:
+
+```
+# device=<1-based starting Multitrack channel of this device's stereo pair>
+# Each device occupies channel N and N+1. Valid range 1-9, pairs must not overlap.
+system=1
+game=3
+music=5
+virtuala=7
+virtualb=9
+```
+
+- **Missing file:** not an error -- one informational log line, falls
+  back to the compiled-in defaults.
+- **Present but invalid** (bad range, missing/duplicate key, or
+  overlapping channel pairs): refuses to start, printing the exact
+  problem (which line, which key, which values overlap) -- same
+  fail-loudly philosophy this file already uses for sample-rate/format
+  mismatches. Fix the file (or delete it to fall back to defaults) and
+  restart.
+
+`--selftest` (see below) never reads this file -- it always exercises its
+own private, `static const` copy of the compiled-in defaults, so the
+self-test stays deterministic and filesystem-independent regardless of
+what `config/channel-map.conf` currently contains. Applying a new mapping
+always requires stopping and restarting the daemon (via the GUI's
+"Apply (restarts daemon)" button, or manually) -- there is no
+SIGHUP/live-reload in this round.
 
 ### Build it
 
@@ -473,27 +589,37 @@ confirm), and runs its **offline self-test** (`--selftest`) automatically.
 ./build/rodevad-router --selftest
 ```
 
-Touches **zero real audio devices** -- it only exercises the ring-buffer
-push/pop math and the channel-mixing/`AudioBufferList`-layout math in
-isolation, using fabricated in-memory buffers. It checks: an exact
-push/pop round trip, correct silence-on-underrun behavior, correct
-partial-availability behavior, all 5 devices mapping into the correct
-(non-overlapping) channel pairs of a single interleaved 10-channel buffer
-simultaneously, the alternate non-interleaved (10 mono buffers) layout
-mapping correctly, and that an out-of-range/unrecognized layout is safely
-rejected rather than corrupting memory. This is the "bounded, silent unit
-test of the channel-copy/mixing math" verification step for this daemon --
-it was also run under AddressSanitizer/UBSan during development (not part
-of the normal build) with zero issues found.
+Touches **zero real audio devices** -- it only exercises pure in-memory
+buffer/file math, using fabricated buffers and (for the config-parsing
+tests) temp files under `/tmp`, never this project's real
+`config/channel-map.conf`. It checks: an exact ring-buffer push/pop round
+trip, correct silence-on-underrun behavior, correct partial-availability
+behavior, all 5 devices mapping into the correct (non-overlapping) channel
+pairs of a single interleaved 10-channel buffer simultaneously, the
+alternate non-interleaved (10 mono buffers) layout mapping correctly, that
+an out-of-range/unrecognized layout is safely rejected rather than
+corrupting memory, the level-metering math (silence/peak/RMS/decay/
+clamping all correct), and that `LoadChannelMapFromConfig` accepts a
+missing file (falls back to defaults) and a valid, deliberately-permuted
+config, while rejecting an overlapping config, an out-of-range value, and
+a config missing a required key -- each with a nonzero exit were it run
+standalone. This is the "bounded, silent unit test of the channel-copy/
+mixing math" verification step for this daemon -- it was also run under
+AddressSanitizer/UBSan during development (not part of the normal build)
+with zero issues found, both before and after the levels/channel-map
+additions.
 
 ### Install as a per-user LaunchAgent (manual -- not run automatically)
 
 `daemon/com.abrendt.rodevad.router.plist` is a **template**;
-`daemon/install-daemon.sh` fills in this project's actual paths and copies
-the result to `~/Library/LaunchAgents/`, then runs `launchctl load`. Like
-the HAL driver's `install.sh`, **this project never runs this script or
-`launchctl load` automatically** -- you run it yourself, deliberately, once
-you're ready to test with real hardware:
+`daemon/install-daemon.sh` fills in this project's actual paths --
+including `WorkingDirectory`, so the daemon's relative `state/`/`config/`
+paths resolve the same way whether it's started manually from the project
+root or via `launchd` -- and copies the result to `~/Library/LaunchAgents/`,
+then runs `launchctl load`. It also creates `state/` and `config/`
+alongside `logs/`. Like the HAL driver's `install.sh`, **this project never
+runs this script or `launchctl load` automatically** -- you run it
+yourself, deliberately, once you're ready to test with real hardware:
 
 ```
 cd ~/Developer/RodeCasterVirtualAudio
@@ -664,15 +790,45 @@ All of these were run locally as part of building this project (see
 | `rodevad-router --selftest` (ring buffer + channel-mixing math, no device IO) | All checks pass |
 | `rodevad-router --selftest` under AddressSanitizer + UBSan | Zero issues found |
 | `daemon/install-daemon.sh` plist template, sed-resolved and `plutil -lint`'d in isolation | Structurally valid |
+| `rodevad-router --selftest`: level-metering math (silence/peak/RMS/decay/clamping) | Correct |
+| `rodevad-router --selftest`: `LoadChannelMapFromConfig` accept/reject cases (missing, valid, overlapping, out-of-range, missing key) | All correct, using temp files under `/tmp`, never the real `config/channel-map.conf` |
+| Full clean `swift build` (deleted `.build`/`.swiftpm` first) | Pass, 0 warnings |
+| GUI `nonisolated` actor-isolation cleanup (Swift 5 language mode; would be hard errors under Swift 6) | Fixed, 0 warnings remain |
 
-**Not yet done, and intentionally out of scope for this round:** installing
-the expanded 5-device driver live via `./install.sh` and re-confirming with
-`system_profiler`/`testtone` against real `coreaudiod` (an earlier,
-single-device version of this driver *was* confirmed live in an earlier
-round of this project -- `./install.sh` needs to be re-run to pick up the
-5-device version), and any live run of `rodevad-router` against the real
-RodeCaster hardware. Both require the manual/live steps in "Next manual
-steps" below.
+By the time this round of work started, the HAL driver and `rodevad-router`
+were **already installed and running live** against real RodeCaster Pro 2
+hardware (confirmed by the coordinator, and independently re-confirmed here
+via `launchctl list` and `ps` -- see the safety note below). This round's
+verification therefore focused on the new daemon/GUI code in isolation
+(compile, codesign, self-test, GUI build/lint/codesign/otool) rather than
+re-installing anything live, per this round's explicit constraints.
+
+**Not done this round, by design:** actually running the new
+`rodevad-router` build against the live Multitrack hardware, installing the
+new GUI's channel-map changes via its "Apply" button, clicking through the
+GUI at all, or touching the live LaunchAgent (`launchctl load`/`unload`/
+`kickstart`, or overwriting `~/Library/LaunchAgents/com.abrendt.rodevad.router.plist`).
+See "Next manual steps" for what that requires.
+
+**Important safety note about the live daemon:** `make daemon`/`make gui`
+rebuild `build/rodevad-router` in place -- the exact path the currently
+*running* live daemon process was launched from. On macOS/Unix this is
+safe for the already-running process itself (it keeps executing the old
+code from memory; overwriting the file on disk doesn't retroactively
+change a process already running from it -- confirmed here by checking the
+live process's elapsed time continued uninterrupted across the rebuild).
+**However**, `com.abrendt.rodevad.router.plist` has `KeepAlive` configured
+to relaunch the daemon on any non-zero exit, using whatever binary is at
+that same path at the time. That means if the live process crashes, is
+manually restarted, or the Mac reboots *before* you've deliberately
+reviewed and accepted the new build, it will pick up this round's new
+(not yet live-tested) code automatically rather than the old, already-
+proven build. This wasn't avoidable while still following the instruction
+to build/verify into `build/` -- flagging it clearly here rather than
+leaving it as a silent risk. If you want a guaranteed-inert safety margin
+until you're ready to test deliberately, consider setting `KeepAlive` to
+`false` temporarily, or copying today's known-good binary aside before the
+next intentional restart.
 
 One real bug was caught and fixed during the original single-device build:
 the CFPlugIn factory function initially returned the address of the
@@ -709,22 +865,38 @@ RodeCasterVirtualAudio/
 ├── tools/
 │   └── testtone.c                 # CLI: list devices / play test tone to device+channel
 ├── gui/
-│   └── RodeVADTester/              # SwiftUI channel-tester GUI (Swift Package)
+│   └── RodeVADTester/              # SwiftUI control-surface GUI (Swift Package)
 │       ├── Package.swift
 │       ├── Info.plist              # Info.plist for the hand-assembled .app bundle
 │       └── Sources/RodeVADTester/
-│           ├── RodeVADTesterApp.swift
-│           ├── ContentView.swift
+│           ├── RodeVADTesterApp.swift    # @main, hosts AppShellView
+│           ├── AppShellView.swift        # owns shared state, TabView, toolbar/donate button
+│           ├── ProjectLayout.swift       # single source of truth for every on-disk path
+│           ├── DashboardView.swift       # at-a-glance status tab
+│           ├── ChannelTesterView.swift   # per-channel test-tone tab (was ContentView)
+│           ├── MetersView.swift          # live level meters tab
+│           ├── LevelMeterView.swift      # dependency-free RMS+peak bar
+│           ├── LevelsPoller.swift        # polls state/rodevad-router.levels, tab-scoped
+│           ├── ChannelMapEditorView.swift # channel-mapping editor tab
+│           ├── ChannelMapStore.swift     # config/channel-map.conf load/save/validate/apply
+│           ├── DaemonControlView.swift   # daemon start/stop/status/log tab
+│           ├── DaemonController.swift    # shells out to install/uninstall-daemon.sh, launchctl status
+│           ├── DaemonLogTail.swift       # cheap seek-from-end log tailing
+│           ├── HALDriverCheck.swift      # read-only HAL driver install check
+│           ├── DonateButton.swift        # pink heart -> PayPal
 │           ├── DeviceStore.swift
 │           ├── AudioDevice.swift
 │           ├── TestToneLocator.swift
 │           └── TestToneRunner.swift
 ├── daemon/
 │   ├── rodevad-router.c                     # the routing daemon (standalone binary)
+│   ├── channel-map.example.conf             # documented format/defaults + GUI fallback template
 │   ├── com.abrendt.rodevad.router.plist     # LaunchAgent template (placeholders filled at install time)
 │   ├── install-daemon.sh                    # per-user install (sed-resolves plist, launchctl load) -- not run automatically
 │   └── uninstall-daemon.sh                  # launchctl unload + remove -- not run automatically
 ├── logs/                           # created by install-daemon.sh; rodevad-router's stdout/stderr
+├── state/                          # created by rodevad-router itself; rodevad-router.levels
+├── config/                         # created by install-daemon.sh; channel-map.conf (optional override)
 └── build/                         # created by `make`/`make gui`/`make daemon`; gitignored-worthy output
     ├── RodeCasterVirtualAudio.driver/
     │   └── Contents/
@@ -742,54 +914,58 @@ RodeCasterVirtualAudio/
 
 ## Next manual steps (you run these yourself)
 
-**Steps 1-5 are the driver alone** (safe, no real hardware audio moves yet).
-**Steps 6+ involve the routing daemon and real hardware, and need the
-coordinator and user present together watching/listening** -- not run
-autonomously, per this project's verification constraints.
+**Current state as of this round:** the HAL driver (5 `RVAD *` devices) and
+`rodevad-router` are already installed and **running live** against real
+RodeCaster Pro 2 hardware. This round added GUI tabs (Dashboard, Levels,
+Channel Mapping, Daemon) and daemon-side support for them (level metering,
+runtime channel-map config) -- built, self-tested, and statically verified,
+but **not yet run live**, and the live LaunchAgent/process were
+deliberately left completely untouched throughout this round (no
+`launchctl load`/`unload`/`kickstart`, no edits to the installed
+`~/Library/LaunchAgents/com.abrendt.rodevad.router.plist`). **This needs
+the coordinator and user present together, watching/listening** -- not run
+autonomously.
 
-1. `cd ~/Developer/RodeCasterVirtualAudio && make` -- already done and
-   verified (5-device driver) as part of building this project, but
-   re-run any time you change the source.
-2. `./install.sh` -- installs to `/Library/Audio/Plug-Ins/HAL/` with `sudo`
-   and restarts `coreaudiod`. **This was intentionally not run for you.**
-   **Important:** if an older single-device version of this driver was
-   installed in an earlier round, this overwrites it with the new
-   5-device version -- the old `"RodeCaster Virtual Audio"` device name
-   will disappear, replaced by the 5 `RVAD *` devices.
-3. Verify: `system_profiler SPAudioDataType | grep -A 8 "RVAD"` or check
-   Audio MIDI Setup.app -- confirm all 5 `RVAD *` devices appear.
-4. `./build/testtone --list`, then `./build/testtone --device "RVAD
-   System" --channel 1` (and `--channel 2`, and the other 4 devices) to
-   confirm each channel actually carries audio -- or `make gui && open
-   build/RodeVADTester.app` for the same thing with buttons instead of
-   flags.
-5. At this point the driver alone is fully working (5 independent virtual
-   loopback devices) -- useful on its own for routing between apps, even
-   before the next steps.
-6. **Connect the RodeCaster Pro 2 over USB** if it isn't already, and
-   confirm `system_profiler SPAudioDataType` shows "RODECaster Pro II Main
-   Multitrack" with 10 channels and a UID starting `AppleUSBAudioEngine:`.
-7. `make daemon` -- builds, ad-hoc signs, and runs the offline
-   `--selftest` for `rodevad-router` (safe, no real device IO -- already
-   done and passing as part of this build).
-8. **With the coordinator and user both present, volume turned down**:
-   `./daemon/install-daemon.sh` -- loads the router as a per-user
-   LaunchAgent (no sudo). Watch/listen for pops, glitches, or feedback
-   immediately. See "Routing daemon > Manual live-testing safety notes"
-   above for the full checklist before doing this.
-9. Check `tail -f logs/rodevad-router.out.log` and
-   `logs/rodevad-router.err.log` to confirm it found all 6 devices,
-   passed its format check, and is running -- not just that it's silent.
-10. Test actual routing: play audio to one `RVAD *` device (e.g. via
-    `testtone` or any app) and confirm it comes out of the expected
-    RodeCaster channel pair. **If it comes out of the wrong channels**,
-    that's expected to potentially need adjustment -- see "Known
-    limitations" for how to edit `kChannelMap[]` and retry.
-11. **Rollback if anything goes wrong:**
-    - Daemon/routing issues: `./daemon/uninstall-daemon.sh` stops audio
-      flow immediately (no sudo, no `coreaudiod` restart needed).
-    - Driver issues: `./uninstall.sh` removes the driver and restarts
-      `coreaudiod`, returning the system to its prior state. If some app
-      is misbehaving because it had an `RVAD *` device selected when it
-      was removed, just re-pick a real device in that app's own audio
-      settings.
+1. Read "Verification results" above's safety note about the live daemon
+   process and `KeepAlive` before doing anything else -- `build/rodevad-router`
+   already has this round's new code sitting at the same path the live
+   process was launched from; the live process itself is unaffected
+   (still running the old, proven code from memory), but a crash/restart
+   before you're ready would auto-load the new build via `KeepAlive`.
+2. When ready to test the new build deliberately (not by accident): with
+   volume turned down, either let the current live process keep running
+   as-is for now, or deliberately restart it via `./daemon/uninstall-daemon.sh`
+   followed by `./daemon/install-daemon.sh` once you want to switch over.
+   Watch/listen for pops, glitches, or feedback immediately, same as any
+   live daemon test -- see "Routing daemon > Manual live-testing safety
+   notes" above.
+3. Check `tail -f logs/rodevad-router.out.log` and
+   `logs/rodevad-router.err.log` -- confirm it found all 6 devices, passed
+   its format check, loaded `config/channel-map.conf` (or logged that it's
+   using defaults), and started the levels-writer thread.
+4. Confirm `state/rodevad-router.levels` is being rewritten roughly every
+   75ms (`watch -n 0.2 cat state/rodevad-router.levels` or similar) --
+   this is what the GUI's Levels tab reads.
+5. `make gui && open build/RodeVADTester.app` -- launch the expanded GUI
+   yourself (this was deliberately not done for you this round). Check:
+   - **Dashboard**: all 4 status rows show green/good.
+   - **Levels**: bars move when audio plays into an `RVAD *` device, and
+     show the "no live data" state correctly if you stop the daemon.
+   - **Channel Mapping**: edit a value, confirm overlap highlighting works
+     by deliberately creating one, then fix it and try "Apply (restarts
+     daemon)" -- watch/listen through this restart too, same caution as
+     any daemon restart.
+   - **Daemon**: Start/Stop buttons work, status + raw log tail both
+     update.
+6. **Rollback if anything goes wrong:**
+   - Daemon/routing issues: `./daemon/uninstall-daemon.sh` stops audio
+     flow immediately (no sudo, no `coreaudiod` restart needed).
+   - Driver issues: `./uninstall.sh` (project root, needs `sudo`) removes
+     the driver and restarts `coreaudiod`, returning the system to its
+     prior state. If some app is misbehaving because it had an `RVAD *`
+     device selected when it was removed, just re-pick a real device in
+     that app's own audio settings.
+   - Channel-mapping issues specifically: edit `config/channel-map.conf`
+     by hand (or delete it to fall back to compiled-in defaults) and
+     restart the daemon -- no rebuild required, since the mapping is now
+     loaded at runtime.

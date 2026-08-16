@@ -5,9 +5,9 @@
 	<!--
 	Per-user LaunchAgent template for rodevad-router.
 
-	This is a TEMPLATE: the __ROUTER_BIN_PATH__, __STDOUT_LOG__, and
-	__STDERR_LOG__ placeholders below are filled in by
-	daemon/install-daemon.sh with this project's actual absolute path
+	This is a TEMPLATE: the __ROUTER_BIN_PATH__, __STDOUT_LOG__,
+	__STDERR_LOG__, and __WORKING_DIR__ placeholders below are filled in by
+	daemon/install-daemon.sh with this project's actual absolute paths
 	before the resolved plist is copied to
 	~/Library/LaunchAgents/com.abrendt.rodevad.router.plist. Do not edit
 	the placeholders in THIS file's copy of the tracked template -- edit
@@ -25,6 +25,16 @@
 	<array>
 		<string>__ROUTER_BIN_PATH__</string>
 	</array>
+
+	<!-- rodevad-router uses relative paths for its state/ (levels file)
+	     and config/ (channel-map override) directories, so its working
+	     directory must be this project's root -- otherwise those
+	     relative paths would resolve against whatever directory launchd
+	     happens to start it in (typically /), not the project. This makes
+	     "run manually from the project root" and "run under launchd"
+	     resolve those paths identically. -->
+	<key>WorkingDirectory</key>
+	<string>__WORKING_DIR__</string>
 
 	<!-- Start it automatically at login/on load... -->
 	<key>RunAtLoad</key>

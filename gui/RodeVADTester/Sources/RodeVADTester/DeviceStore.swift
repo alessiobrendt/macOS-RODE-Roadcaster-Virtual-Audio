@@ -11,10 +11,28 @@ final class DeviceStore: ObservableObject {
         devices.first { $0.id == selectedDeviceID }
     }
 
+    /// Count of our own "RVAD *" virtual devices currently visible to
+    /// CoreAudio -- used by DashboardView to show "5/5 devices visible"
+    /// at a glance. Prefix match (not exact name) so it's robust to the
+    /// exact 5 names without hardcoding each one here.
+    var rvadDeviceCount: Int {
+        devices.filter { $0.name.hasPrefix("RVAD ") }.count
+    }
+
+    /// The RodeCaster Pro 2's real "Main Multitrack" hardware device, if
+    /// currently connected -- matched by UID substring "RODECaster Pro II",
+    /// the same convention daemon/rodevad-router.c itself uses (see
+    /// FindMultitrackDevice in that file), deliberately NOT by display
+    /// name, since RODE/Apple could tweak the human-readable name across
+    /// firmware/driver updates without changing the UID pattern.
+    var multitrackDevice: AudioDevice? {
+        devices.first { $0.uid.contains("RODECaster Pro II") }
+    }
+
     /// The device name we prefer to auto-select the first time the list
     /// loads successfully -- our own virtual driver, if it's installed
     /// and running.
-    private static let preferredDeviceName = "RodeCaster Virtual Audio"
+    private static let preferredDeviceName = "RVAD System"
 
     func refresh() {
         isLoading = true

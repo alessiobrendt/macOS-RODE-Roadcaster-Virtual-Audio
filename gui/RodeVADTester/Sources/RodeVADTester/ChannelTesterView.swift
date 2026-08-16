@@ -1,7 +1,14 @@
 import SwiftUI
 
-struct ContentView: View {
-    @StateObject private var store = DeviceStore()
+/// The "Channel Test" tab (formerly the entire app, back when it was just
+/// ContentView -- renamed as part of the multi-tab expansion). Body/logic
+/// is otherwise unchanged from the original ContentView: still just
+/// shells out to testtone per channel. The one wiring change is that
+/// `store` is now an injected, shared DeviceStore (owned by AppShellView
+/// and also used by DashboardView) rather than a private @StateObject
+/// each tab created its own copy of.
+struct ChannelTesterView: View {
+    @EnvironmentObject var store: DeviceStore
 
     /// Per-channel UI state, keyed by 1-based channel number.
     @State private var playingChannels: Set<Int> = []
@@ -36,7 +43,7 @@ struct ContentView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("RodeCaster Virtual Audio — Channel Tester")
+            Text("Channel Test")
                 .font(.title2)
                 .bold()
             Text("Plays a short test tone to a single output channel at a time via the testtone CLI, so you can confirm each channel of the virtual driver (or any other CoreAudio output device) actually carries audio.")

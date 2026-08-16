@@ -4,8 +4,12 @@ import SwiftUI
 struct RodeVADTesterApp: App {
     var body: some Scene {
         WindowGroup("RodeCaster Virtual Audio Tester") {
-            ContentView()
+            AppShellView()
         }
-        .windowResizability(.contentSize)
+        // .contentSize resizability doesn't fit a tabbed control-surface
+        // layout well (each tab wants a different natural size); let the
+        // window resize freely instead, with AppShellView supplying its
+        // own minWidth/minHeight floor.
+        .windowResizability(.contentMinSize)
     }
 }

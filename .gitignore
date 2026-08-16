@@ -5,3 +5,5 @@ build/
 gui/RodeVADTester/.build/
 gui/RodeVADTester/.swiftpm/
 logs/
+state/
+config/

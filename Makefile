@@ -81,7 +81,7 @@ daemon-selftest: $(DAEMON_BIN)
 # sufficient), then hand-assembles a minimal .app bundle around the
 # resulting executable, matching the same Info.plist / Contents/MacOS
 # layout convention used by the HAL driver bundle above.
-gui: testtone
+gui: testtone daemon
 	@echo "--- swift build (release, arm64) ---"
 	cd $(GUI_DIR) && swift build -c release --arch arm64
 	@mkdir -p $(GUI_MACOS_DIR)
