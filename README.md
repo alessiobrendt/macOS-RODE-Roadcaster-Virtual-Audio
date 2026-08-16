@@ -1,4 +1,14 @@
+<p align="center">
+  <img src="gui/RodeVADTester/Resources/AppIconSource/icon-source.png" width="160" alt="VAD app icon">
+</p>
+
 # RodeCasterVirtualAudio
+
+<p align="center">
+  <a href="https://www.paypal.com/paypalme/alessiobrendt">
+    <img src="https://img.shields.io/badge/Donate-PayPal-00457C?style=for-the-badge&logo=paypal&logoColor=white" alt="Donate via PayPal">
+  </a>
+</p>
 
 A self-built macOS CoreAudio virtual audio driver plus a routing daemon,
 written from scratch, to fully replace RØDE's official virtual audio driver
