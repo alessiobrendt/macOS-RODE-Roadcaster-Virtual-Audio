@@ -18,6 +18,15 @@ VERSION_PLIST_SRC := Resources/version.plist
 TESTTONE_SRC   := tools/testtone.c
 TESTTONE_BIN   := $(BUILD_DIR)/testtone
 
+GUI_DIR         := gui/RodeVADTester
+GUI_PRODUCT     := RodeVADTester
+GUI_APP         := $(BUILD_DIR)/$(GUI_PRODUCT).app
+GUI_CONTENTS    := $(GUI_APP)/Contents
+GUI_MACOS_DIR   := $(GUI_CONTENTS)/MacOS
+GUI_EXECUTABLE  := $(GUI_MACOS_DIR)/$(GUI_PRODUCT)
+GUI_INFO_PLIST_SRC := $(GUI_DIR)/Info.plist
+GUI_BUILT_BIN   := $(GUI_DIR)/.build/release/$(GUI_PRODUCT)
+
 CC             := clang
 ARCH           := arm64
 SDK            := $(shell xcrun --sdk macosx --show-sdk-path)
@@ -31,7 +40,7 @@ TOOL_CFLAGS    := -arch $(ARCH) -isysroot $(SDK) -mmacosx-version-min=12.0 \
 
 FRAMEWORKS     := -framework CoreFoundation -framework CoreAudio -framework AudioToolbox
 
-.PHONY: all clean sign verify install-info testtone
+.PHONY: all clean sign verify install-info testtone gui gui-verify
 
 all: $(BUNDLE) verify testtone
 
@@ -40,6 +49,30 @@ testtone: $(TESTTONE_BIN)
 $(TESTTONE_BIN): $(TESTTONE_SRC)
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(TOOL_CFLAGS) -o $(TESTTONE_BIN) $(TESTTONE_SRC) $(FRAMEWORKS)
+
+# Builds the SwiftUI channel-tester GUI app via `swift build` (no Xcode
+# required -- Swift Package Manager + the Command Line Tools are
+# sufficient), then hand-assembles a minimal .app bundle around the
+# resulting executable, matching the same Info.plist / Contents/MacOS
+# layout convention used by the HAL driver bundle above.
+gui: testtone
+	@echo "--- swift build (release, arm64) ---"
+	cd $(GUI_DIR) && swift build -c release --arch arm64
+	@mkdir -p $(GUI_MACOS_DIR)
+	cp $(GUI_BUILT_BIN) $(GUI_EXECUTABLE)
+	cp $(GUI_INFO_PLIST_SRC) $(GUI_CONTENTS)/Info.plist
+	$(MAKE) gui-verify
+
+gui-verify:
+	@echo "--- plutil -lint GUI Info.plist ---"
+	plutil -lint $(GUI_CONTENTS)/Info.plist
+	@echo "--- codesign (ad-hoc) GUI app ---"
+	codesign --force --deep --sign - $(GUI_APP)
+	codesign -dv $(GUI_APP)
+	@echo "--- otool: confirm SwiftUI/AppKit linkage ---"
+	otool -L $(GUI_EXECUTABLE) | grep -qE 'SwiftUI|AppKit' && \
+		echo "OK: GUI executable links SwiftUI/AppKit" || \
+		(echo "FAIL: GUI executable does not link SwiftUI/AppKit" && exit 1)
 
 $(EXECUTABLE): $(SRC)
 	@mkdir -p $(MACOS_DIR)

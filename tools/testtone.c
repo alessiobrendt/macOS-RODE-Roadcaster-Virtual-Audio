@@ -175,9 +175,56 @@ static void ListDevices(void)
     free(theDevices);
 }
 
-// Resolves a user-supplied device selector (numeric index into the
-// filtered output-device listing, or a case-insensitive substring of the
-// device name) to an AudioDeviceID. Returns kAudioObjectUnknown on failure.
+// Same enumeration as ListDevices(), but emits tab-separated fields
+// (index, channels, name, uid) with no header/decoration -- intended for
+// other tools (e.g. the RodeVADTester GUI) to parse programmatically.
+// Tab-separated rather than fixed-width columns because device names can
+// contain multi-byte UTF-8 characters (e.g. "RODECaster"), which throws
+// off C's byte-counted %-Ns field padding relative to a Unicode-aware
+// reader -- splitting on a delimiter that can't appear in a name/uid
+// sidesteps that entirely.
+static void ListDevicesMachine(void)
+{
+    AudioDeviceID *theDevices = NULL;
+    UInt32 theCount = 0;
+    OSStatus theStatus = CopyAllOutputDeviceIDs(&theDevices, &theCount);
+    if (theStatus != noErr)
+    {
+        fprintf(stderr, "error: could not enumerate audio devices (status %d)\n", (int)theStatus);
+        return;
+    }
+
+    UInt32 thePrintedIndex = 0;
+    for (UInt32 i = 0; i < theCount; ++i)
+    {
+        UInt32 theChannels = GetOutputChannelCount(theDevices[i]);
+        if (theChannels == 0)
+        {
+            continue;
+        }
+
+        CFStringRef theName = CopyDeviceName(theDevices[i]);
+        CFStringRef theUID = CopyDeviceUID(theDevices[i]);
+
+        char theNameBuf[256] = "(unknown)";
+        char theUIDBuf[256] = "(unknown)";
+        if (theName != NULL) CFStringGetCString(theName, theNameBuf, sizeof(theNameBuf), kCFStringEncodingUTF8);
+        if (theUID != NULL) CFStringGetCString(theUID, theUIDBuf, sizeof(theUIDBuf), kCFStringEncodingUTF8);
+
+        printf("%u\t%u\t%s\t%s\n", thePrintedIndex, theChannels, theNameBuf, theUIDBuf);
+
+        if (theName != NULL) CFRelease(theName);
+        if (theUID != NULL) CFRelease(theUID);
+        thePrintedIndex += 1;
+    }
+
+    free(theDevices);
+}
+
+// Resolves a user-supplied device selector -- a numeric index into the
+// filtered output-device listing, an exact device UID, or (as a last
+// resort) a case-insensitive substring of the device name -- to an
+// AudioDeviceID. Returns kAudioObjectUnknown on failure.
 static AudioDeviceID ResolveDevice(const char *inSelector)
 {
     AudioDeviceID *theDevices = NULL;
@@ -206,6 +253,23 @@ static AudioDeviceID ResolveDevice(const char *inSelector)
     if (theEndPtr != inSelector && *theEndPtr == '\0' && theIndex >= 0 && (UInt32)theIndex < theOutputCount)
     {
         return theOutputDevices[theIndex];
+    }
+
+    // Try an exact device UID match next -- UIDs are unique and stable
+    // for a given device/driver, so this is the most reliable way for
+    // another program (e.g. a GUI that already enumerated devices) to
+    // target a specific device without relying on name matching.
+    for (UInt32 i = 0; i < theOutputCount; ++i)
+    {
+        CFStringRef theUID = CopyDeviceUID(theOutputDevices[i]);
+        if (theUID == NULL) continue;
+        char theUIDBuf[256];
+        Boolean ok = CFStringGetCString(theUID, theUIDBuf, sizeof(theUIDBuf), kCFStringEncodingUTF8);
+        CFRelease(theUID);
+        if (ok && strcmp(theUIDBuf, inSelector) == 0)
+        {
+            return theOutputDevices[i];
+        }
     }
 
     // Fall back to a case-insensitive substring match on the device name.
@@ -375,7 +439,12 @@ static void PrintUsage(const char *inProgName)
 {
     printf("usage:\n");
     printf("  %s --list\n", inProgName);
-    printf("  %s --device <name-substring-or-index> [--channel N] [--duration SECS] [--freq HZ]\n", inProgName);
+    printf("  %s --list-machine\n", inProgName);
+    printf("  %s --device <name-substring-or-index-or-uid> [--channel N] [--duration SECS] [--freq HZ]\n", inProgName);
+    printf("\n");
+    printf("  --list-machine prints one tab-separated line per output device:\n");
+    printf("      index\\tchannels\\tname\\tuid\n");
+    printf("  with no header, for other programs to parse.\n");
     printf("\n");
     printf("examples:\n");
     printf("  %s --list\n", inProgName);
@@ -396,12 +465,17 @@ int main(int argc, char **argv)
     Float64 theDuration = kDefaultDurationSecs;
     Float64 theFrequency = kDefaultFrequencyHz;
     int wantList = 0;
+    int wantListMachine = 0;
 
     for (int i = 1; i < argc; ++i)
     {
         if (strcmp(argv[i], "--list") == 0)
         {
             wantList = 1;
+        }
+        else if (strcmp(argv[i], "--list-machine") == 0)
+        {
+            wantListMachine = 1;
         }
         else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc)
         {
@@ -430,6 +504,12 @@ int main(int argc, char **argv)
             PrintUsage(argv[0]);
             return 2;
         }
+    }
+
+    if (wantListMachine)
+    {
+        ListDevicesMachine();
+        return 0;
     }
 
     if (wantList)

@@ -2,3 +2,5 @@ build/
 *.o
 *.dSYM/
 .DS_Store
+gui/RodeVADTester/.build/
+gui/RodeVADTester/.swiftpm/

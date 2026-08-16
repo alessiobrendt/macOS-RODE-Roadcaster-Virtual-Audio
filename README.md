@@ -82,6 +82,13 @@ nothing is copied from any third-party driver.
   verify each virtual channel actually carries audio before wiring the
   driver into RodeCaster Central / FineTune.
 
+- **`gui/RodeVADTester/`** -- a small native SwiftUI app, built as a Swift
+  Package (no Xcode.app required, just the Command Line Tools' `swift`
+  toolchain), that wraps `testtone` in a window: a device picker and one
+  "Play" button per channel, for testing without a terminal. See "Testing
+  individual outputs > GUI" below. It shells out to the already-verified
+  `testtone` binary rather than reimplementing playback in Swift.
+
 - **`src/test_harness.c`** -- a small extra verification tool (not part of
   the shipped driver) that loads the built `.driver` bundle the same way
   `coreaudiod` does (via `CFBundle`/`dlopen`), calls the factory function,
@@ -230,6 +237,64 @@ routed to the chosen device with `kAudioQueueProperty_CurrentDevice`, filling
 only the requested channel's samples in the interleaved buffer and leaving
 every other channel at 0.
 
+`testtone` also has a `--list-machine` mode that prints the same device
+listing as tab-separated fields (`index\tchannels\tname\tuid`, no header) for
+other programs to parse -- this is what the GUI below uses instead of
+scraping the human-readable `--list` table.
+
+### GUI
+
+For clicking buttons instead of typing commands, there's a small native
+SwiftUI app, **RodeCaster VAD Tester**, under `gui/RodeVADTester/`. It's a
+thin GUI wrapper around the same `testtone` binary described above -- it
+does not reimplement audio playback -- so it shares exactly the same
+tested, verified playback path; it just gives you a device picker and one
+"Play" button per channel instead of a terminal.
+
+Build it (implies `make testtone` first, since the GUI shells out to it):
+
+```
+make gui
+```
+
+This runs `swift build` (Swift Package Manager, no Xcode.app required --
+only the Command Line Tools' Swift toolchain) and hand-assembles the result
+into `build/RodeVADTester.app`, then runs the same style of verification as
+the driver bundle: `plutil -lint` on its `Info.plist`, ad-hoc `codesign`,
+and an `otool -L` check that the executable actually links
+`SwiftUI`/`AppKit`.
+
+Launch it:
+
+```
+open build/RodeVADTester.app
+```
+
+or run the executable directly to see console output/errors:
+
+```
+./build/RodeVADTester.app/Contents/MacOS/RodeVADTester
+```
+
+What it does:
+- On launch (and via the **Refresh** button), runs
+  `./build/testtone --list-machine` next to the app bundle and populates a
+  device picker, defaulting to "RodeCaster Virtual Audio" if it's present
+  (otherwise the first device in the list).
+- Once a device is selected, shows one row per output channel (channel
+  count comes straight from that device -- 2 for our virtual driver by
+  default, but it works for any device with any channel count, e.g. the
+  RodeCaster Pro 2's own 10-channel "Main Multitrack" USB stream).
+- Each row's **Play** button runs
+  `./build/testtone --device <uid> --channel <n> --duration <n>` as a
+  subprocess (selecting the device by its stable UID, not by name/index,
+  to avoid any ambiguity), shows "Playing channel N..." while it runs, and
+  disables that row's button until it finishes (so you can't overlap two
+  calls to the same channel). A stepper lets you adjust the tone length
+  (0.5-5.0s, default 1.5s) before pressing Play.
+- The app is not installed anywhere system-wide -- it stays in `build/`
+  alongside `testtone` and the driver bundle.
+
 ## Routing the RodeCaster Pro 2 through this driver (conceptual)
 
 This driver is a pure macOS-side virtual cable -- it has no knowledge of the
@@ -278,6 +343,19 @@ stereo mix-down.
   cannot be fully predicted or automated from this project; the exact
   wording and location of the "allow this extension" control has moved
   around between recent macOS versions.
+- **The GUI app must stay next to `testtone`.** `RodeVADTester.app` locates
+  the `testtone` binary as a sibling of the `.app` bundle (i.e. both must
+  live directly inside `build/`, which is exactly what `make gui` produces).
+  If you move the `.app` out of `build/` on its own, it will fail to find
+  `testtone` and show an error banner rather than silently doing nothing.
+  No app icon is bundled (falls back to the generic app icon), and it is
+  not code-signed with a Developer ID -- same ad-hoc-signing caveat as the
+  driver itself, and it is never installed outside `build/`.
+- **No SwiftUI `#Preview` support in this build.** Xcode's `#Preview` macro
+  requires a plugin (`PreviewsMacros`) that only ships with Xcode.app, not
+  the bare Command Line Tools, so it was removed from `ContentView.swift`.
+  This has no effect on the built app; it only means there's no
+  canvas-style live preview while editing.
 
 No other blockers were hit: the driver builds cleanly with `-Wall -Wextra`
 and zero warnings, and the functional test harness's write-then-read round
@@ -298,7 +376,11 @@ All of these were run locally as part of building this project (see
 | `nm -gU` factory symbol export check | `RodeCasterVirtualAudio_Factory` exported |
 | `test_harness` dlopen + `Initialize` + property round trip | All checks pass |
 | `test_harness` `StartIO`/`DoIOOperation` write->read ring-buffer round trip | Samples match exactly (loopback proven) |
-| `testtone --list` | Correctly enumerates all CoreAudio output devices |
+| `testtone --list` / `--list-machine` | Correctly enumerates all CoreAudio output devices |
+| Installed live via `install.sh` | Confirmed: `system_profiler SPAudioDataType` shows "RodeCaster Virtual Audio", 2 in/2 out @ 48kHz |
+| `testtone --device "RodeCaster Virtual Audio" --channel 1` | Confirmed: played successfully against the live installed driver |
+| `make gui` (SwiftUI app build) | Pass, 0 warnings |
+| GUI `plutil -lint` / `codesign -dv` / `otool -L` (SwiftUI linkage) | All pass |
 
 One real bug was caught and fixed during this process: the CFPlugIn
 factory function initially returned the address of the driver-reference
@@ -326,13 +408,28 @@ RodeCasterVirtualAudio/
 │   └── test_harness.c             # local dlopen-based functional test (not shipped)
 ├── tools/
 │   └── testtone.c                 # CLI: list devices / play test tone to device+channel
-└── build/                         # created by `make`; gitignored-worthy output
+├── gui/
+│   └── RodeVADTester/              # SwiftUI channel-tester GUI (Swift Package)
+│       ├── Package.swift
+│       ├── Info.plist              # Info.plist for the hand-assembled .app bundle
+│       └── Sources/RodeVADTester/
+│           ├── RodeVADTesterApp.swift
+│           ├── ContentView.swift
+│           ├── DeviceStore.swift
+│           ├── AudioDevice.swift
+│           ├── TestToneLocator.swift
+│           └── TestToneRunner.swift
+└── build/                         # created by `make`/`make gui`; gitignored-worthy output
     ├── RodeCasterVirtualAudio.driver/
     │   └── Contents/
     │       ├── Info.plist
     │       ├── MacOS/RodeCasterVirtualAudio
     │       └── version.plist
     ├── testtone
+    ├── RodeVADTester.app/
+    │   └── Contents/
+    │       ├── Info.plist
+    │       └── MacOS/RodeVADTester
     └── test_harness (if built manually)
 ```
 
@@ -349,7 +446,8 @@ RodeCasterVirtualAudio/
    or check Audio MIDI Setup.app.
 4. `./build/testtone --list`, then `./build/testtone --device "RodeCaster
    Virtual Audio" --channel 1` (and `--channel 2`) to confirm each channel
-   actually carries audio.
+   actually carries audio -- or `make gui && open build/RodeVADTester.app`
+   for the same thing with buttons instead of flags.
 5. Pick "RodeCaster Virtual Audio" as the input/output device in whatever
    app needs it, and configure RodeCaster Central / FineTune routing as
    described above.
