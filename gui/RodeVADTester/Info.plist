@@ -21,9 +21,9 @@
 	<key>CFBundleSignature</key>
 	<string>????</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0.0</string>
+	<string>1.1.0</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>NSPrincipalClass</key>
@@ -34,5 +34,7 @@
 	<string>public.app-category.utilities</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Local utility, not for distribution.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>The embedded rodevad-router daemon reads audio from this app's own virtual RVAD devices (not your physical microphone) so it can route it to the RodeCaster Pro 2. macOS requires this description before it will grant that access at all -- without it, the request is refused automatically with no prompt.</string>
 </dict>
 </plist>

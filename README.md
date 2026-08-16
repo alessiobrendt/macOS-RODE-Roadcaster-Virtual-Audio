@@ -39,13 +39,14 @@ This channel mapping is editable at runtime via `config/channel-map.conf` (or th
 
 ## VAD — the control app
 
-A SwiftUI app (`gui/RodeVADTester/`, builds to `VAD.app`) is the day-to-day control surface, with six tabs:
+A SwiftUI app (`gui/RodeVADTester/`, builds to `VAD.app`) is the day-to-day control surface, with seven tabs:
 
 - **Dashboard** — at-a-glance status (driver installed, RodeCaster connected, all 5 devices visible, daemon running) plus a "Launch at Login" toggle.
 - **Channel Test** — play a test tone into any device/channel, individually or with an Auto Test mode that cycles through every channel in sequence.
 - **Levels** — live per-channel meters (peak + RMS), so you can see audio actually flowing.
 - **Channel Mapping** — edit which RodeCaster channels each virtual device routes to, with a Reset to Defaults button. Changes apply on demand (restarts the daemon), never automatically.
 - **Daemon** — start/stop the routing daemon, see live status and logs.
+- **Fix Audio** — diagnoses the most common "daemon looks healthy but I hear nothing" case (see "No sound even though everything looks fine" below) by actively playing a test tone and watching whether the daemon actually captures it, then links straight to the right System Settings pane and restarts the daemon in one click.
 - **Restart** — restarts macOS's `coreaudiod` (reloads all audio drivers system-wide) and the daemon, for when things get stuck. This briefly interrupts all system audio and needs your admin password — gated behind a confirmation dialog.
 
 The app never reimplements audio playback or device enumeration itself — everything shells out to the same tested CLI tools (`testtone`, the daemon) used from the command line.
@@ -104,9 +105,42 @@ To remove everything: `./uninstall.sh` (driver) and `./daemon/uninstall-daemon.s
 
 Run `./build/testtone --help` for the full flag list.
 
+## No sound even though everything looks fine
+
+The most common real-world failure: the Dashboard shows the driver
+installed, all 5 devices visible, and the daemon running, its log has no
+`ERROR` lines at all — yet every channel's level meter stays at exactly
+`0.000` and nothing you play comes through, even with a test tone actively
+playing. macOS never shows an error for this; it just silently delivers
+empty audio to the capture callback. Confirmed (via live system-log
+investigation, not guesswork) on macOS 26.6.1, two independent causes:
+
+1. **Missing `NSMicrophoneUsageDescription`.** `rodevad-router` lives
+   inside `VAD.app`'s bundle, so macOS's TCC resolves the daemon's
+   Microphone-permission "subject" up to `VAD.app` itself. Without that
+   Info.plist key, TCC **hard-refuses the request automatically — no
+   prompt ever appears**, regardless of what's toggled in Privacy & Security.
+   Fixed by adding the key to `gui/RodeVADTester/Info.plist`.
+2. **Plain ad-hoc code signing** (`codesign --sign -`). Confirmed via the
+   kernel's AMFI log (`amfid: ... "adhoc signed or signed by an unknown
+   certificate chain"`) that macOS 26+ silently withholds real-time
+   CoreAudio HAL data from ad-hoc-signed processes — the process still
+   launches and registers its IOProcs completely healthily. A real
+   certificate is required, but it does **not** need to be a paid Apple
+   Developer ID — a free, local, self-signed one is enough (AMFI's
+   complaint here is "no certificate chain at all", not "chain isn't
+   trusted"). `tools/ensure-codesign-identity.sh` creates one automatically
+   on first build.
+
+Both are fixed as of this build. If you're still hitting this on a build
+that predates the fix (or after making your own code changes), use the
+**Fix Audio** tab: it plays a real test tone and watches whether the daemon
+actually captures it, explains what's likely wrong, and gives one-click
+links to the relevant System Settings panes plus a one-click daemon restart.
+
 ## Known limitations
 
-- **Ad-hoc code signing only** — no paid Apple Developer ID / notarization. Expect a Gatekeeper "unidentified developer" prompt on first install/launch; right-click → Open, or allow it in System Settings → Privacy & Security.
+- **Ad-hoc code signing is no longer used** for `testtone`/`rodevad-router`/`VAD.app` — see "No sound even though everything looks fine" above for why. The build creates and uses a free, local, self-signed certificate (`tools/ensure-codesign-identity.sh`) instead; no paid Apple Developer ID is required, but you may still see a Gatekeeper "unidentified developer" prompt on first install/launch since this isn't notarized — right-click → Open, or allow it in System Settings → Privacy & Security. The router daemon's signed identifier is also pinned (`--identifier`) so it stays stable across rebuilds.
 - **The 10-channel mapping is a best-effort guess**, not confirmed against RØDE's actual internal channel assignments. If audio comes out on unexpected RodeCaster channels, adjust it in the Channel Mapping tab or `config/channel-map.conf`.
 - **No sample-rate conversion** — if the virtual devices and the Multitrack device ever end up at different sample rates, the daemon refuses to start rather than produce garbled audio, and logs a specific error.
 - **No per-app volume/mute controls** on the virtual devices — they're plain loopback devices with no `AudioObjectPropertyControlList` entries.

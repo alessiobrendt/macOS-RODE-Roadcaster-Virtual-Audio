@@ -36,6 +36,9 @@ struct AppShellView: View {
             DaemonControlView()
                 .tabItem { Label("Daemon", systemImage: "gearshape.2.fill") }
 
+            FixAudioView()
+                .tabItem { Label("Fix Audio", systemImage: "stethoscope") }
+
             RestartView()
                 .tabItem { Label("Restart", systemImage: "arrow.triangle.2.circlepath") }
         }

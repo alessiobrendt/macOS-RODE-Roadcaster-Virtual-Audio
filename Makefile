@@ -44,7 +44,7 @@ INSTALLER_COMPONENT_PLIST := $(BUILD_DIR)/VAD-component.plist
 INSTALLER_COMPONENT_PKG  := $(BUILD_DIR)/VAD-component.pkg
 INSTALLER_PKG            := $(BUILD_DIR)/RodeCasterVirtualAudio-Installer.pkg
 INSTALLER_APP_IDENTIFIER := com.abrendt.rodecastervad.pkg.app
-INSTALLER_VERSION        := 1.0.0
+INSTALLER_VERSION        := 1.1.0
 
 CC             := clang
 ARCH           := arm64
@@ -59,7 +59,29 @@ TOOL_CFLAGS    := -arch $(ARCH) -isysroot $(SDK) -mmacosx-version-min=12.0 \
 
 FRAMEWORKS     := -framework CoreFoundation -framework CoreAudio -framework AudioToolbox
 
-.PHONY: all everything clean sign verify install-info testtone gui gui-verify gui-icon daemon daemon-verify daemon-selftest installer
+.PHONY: all everything clean sign verify install-info testtone gui gui-verify gui-icon daemon daemon-verify daemon-selftest installer ensure-codesign-identity
+
+CODESIGN_IDENTITY := RodeCasterVAD Local Dev
+
+# Confirmed on macOS 26.6.1: plain ad-hoc signing (`codesign --sign -`) is
+# not enough for a process to actually receive real-time CoreAudio HAL I/O
+# data. The process launches and registers its IOProcs completely
+# healthily -- no errors anywhere -- but the kernel's AMFI code-integrity
+# check silently withholds the actual audio instead of raising an error:
+#   amfid: rodevad-router not valid: Error Domain=AppleMobileFileIntegrityError
+#   Code=-423 "The file is adhoc signed or signed by an unknown certificate chain"
+# This produced the single most confusing failure mode in this project: a
+# router daemon that looks perfectly healthy yet every channel's level
+# meter stays at exactly 0.000 forever, even with a test tone actively
+# playing. Confirmed live: signing with a real certificate -- even a free,
+# local, self-signed one, no paid Apple Developer ID needed -- fixes it
+# immediately; AMFI's complaint here is "no real certificate chain at all"
+# (ad-hoc), not "chain isn't trusted", so an untrusted self-signed identity
+# still satisfies it. tools/ensure-codesign-identity.sh creates that
+# identity in this machine's login keychain (idempotent, local-only) the
+# first time it's needed.
+ensure-codesign-identity:
+	@tools/ensure-codesign-identity.sh
 
 all: $(BUNDLE) verify testtone
 
@@ -70,7 +92,10 @@ all: $(BUNDLE) verify testtone
 # (the .pkg build) runs first.
 everything: all daemon gui
 
-testtone: $(TESTTONE_BIN)
+testtone: $(TESTTONE_BIN) ensure-codesign-identity
+	@echo "--- codesign testtone ---"
+	codesign --force --sign "$(CODESIGN_IDENTITY)" $(TESTTONE_BIN)
+	codesign -dv $(TESTTONE_BIN)
 
 $(TESTTONE_BIN): $(TESTTONE_SRC)
 	@mkdir -p $(BUILD_DIR)
@@ -88,9 +113,19 @@ $(DAEMON_BIN): $(DAEMON_SRC)
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(TOOL_CFLAGS) -o $(DAEMON_BIN) $(DAEMON_SRC) $(FRAMEWORKS)
 
-daemon-verify: $(DAEMON_BIN)
-	@echo "--- codesign (ad-hoc) rodevad-router ---"
-	codesign --force --sign - $(DAEMON_BIN)
+DAEMON_CODESIGN_IDENTIFIER := com.abrendt.rodevad.router
+
+daemon-verify: $(DAEMON_BIN) ensure-codesign-identity
+	@echo "--- codesign rodevad-router (real local identity, not ad-hoc -- see ensure-codesign-identity above) ---"
+	# Also explicit --identifier so the signed identity stays the SAME
+	# string across rebuilds -- a bare (non-bundled) executable with no
+	# embedded Info.plist otherwise gets an auto-generated "<name>-<hash>"
+	# identifier from codesign, changing every rebuild and resetting any
+	# macOS privacy permission (Microphone / Screen & System Audio
+	# Recording) the user already granted this binary. Real (non-ad-hoc)
+	# signatures are NOT purely content-hash-pinned by TCC the way ad-hoc
+	# ones are, so this identifier now genuinely does survive rebuilds.
+	codesign --force --sign "$(CODESIGN_IDENTITY)" --identifier $(DAEMON_CODESIGN_IDENTIFIER) $(DAEMON_BIN)
 	codesign -dv $(DAEMON_BIN)
 	@echo "--- offline self-test (pure buffer math, no device IO) ---"
 	$(DAEMON_BIN) --selftest
@@ -155,7 +190,7 @@ gui: testtone daemon gui-icon
 	cp $(DAEMON_BIN) $(GUI_MACOS_DIR)/rodevad-router
 	$(MAKE) gui-verify
 
-gui-verify:
+gui-verify: ensure-codesign-identity
 	@echo "--- plutil -lint GUI Info.plist ---"
 	plutil -lint $(GUI_CONTENTS)/Info.plist
 	@echo "--- verify embedded testtone + rodevad-router are present and executable ---"
@@ -167,9 +202,29 @@ gui-verify:
 		file $(GUI_RESOURCES_DIR)/AppIcon.icns | grep -q "Mac OS X icon" && \
 		echo "OK: Contents/Resources/AppIcon.icns present and recognized as a Mac OS X icon" || \
 		(echo "FAIL: Contents/Resources/AppIcon.icns missing or not a valid icns" && exit 1)
-	@echo "--- codesign (ad-hoc) GUI app ---"
-	codesign --force --deep --sign - $(GUI_APP)
+	@echo "--- codesign embedded testtone (real local identity, not ad-hoc) ---"
+	codesign --force --sign "$(CODESIGN_IDENTITY)" $(GUI_MACOS_DIR)/testtone
+	@echo "--- codesign embedded rodevad-router (real local identity + same stable --identifier as daemon-verify) ---"
+	# Signed individually here, and the outer app below is signed WITHOUT
+	# --deep -- codesign --deep re-signs every nested Mach-O it finds
+	# using its own defaults (ad-hoc, auto-generated "<name>-<hash>"
+	# identifier), silently discarding both the real signing identity and
+	# the stable --identifier and reintroducing the AMFI-silently-mutes-
+	# audio bug AND the "TCC permission resets on every rebuild" bug
+	# described above ensure-codesign-identity / in daemon-verify's
+	# comment. Signing nested items first, then the outer bundle without
+	# --deep, keeps both stable AND still produces a bundle that
+	# passes `codesign --verify --deep --strict` (see the check below).
+	codesign --force --sign "$(CODESIGN_IDENTITY)" --identifier $(DAEMON_CODESIGN_IDENTIFIER) $(GUI_MACOS_DIR)/rodevad-router
+	@echo "--- codesign GUI app bundle (real local identity, outer only, not --deep -- see above) ---"
+	codesign --force --sign "$(CODESIGN_IDENTITY)" $(GUI_APP)
 	codesign -dv $(GUI_APP)
+	@echo "--- verify the whole bundle, including nested code, actually validates ---"
+	codesign --verify --deep --strict $(GUI_APP)
+	@echo "--- confirm embedded rodevad-router kept its stable identifier ---"
+	codesign -dv $(GUI_MACOS_DIR)/rodevad-router 2>&1 | grep -q "Identifier=$(DAEMON_CODESIGN_IDENTIFIER)$$" && \
+		echo "OK: embedded rodevad-router identifier is $(DAEMON_CODESIGN_IDENTIFIER)" || \
+		(echo "FAIL: embedded rodevad-router lost its stable identifier" && exit 1)
 	@echo "--- otool: confirm SwiftUI/AppKit linkage ---"
 	otool -L $(GUI_EXECUTABLE) | grep -qE 'SwiftUI|AppKit' && \
 		echo "OK: GUI executable links SwiftUI/AppKit" || \
