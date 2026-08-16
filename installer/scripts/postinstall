@@ -39,6 +39,19 @@ DRIVER_DEST="/Library/Audio/Plug-Ins/HAL/RodeCasterVirtualAudio.driver"
 PLIST_TEMPLATE="$STAGING/com.abrendt.rodevad.router.plist"
 ROUTER_LABEL="com.abrendt.rodevad.router"
 
+# Clean up the temporary staging payload on ANY exit path (success, the
+# "no console user found" early exit, or any error exit) via a trap,
+# rather than a single hardcoded `rm -rf` partway through the script.
+# An earlier version of this script did the latter -- it removed $STAGING
+# right after the driver was relocated out of it, but BEFORE the script
+# later read $PLIST_TEMPLATE (also inside $STAGING) further down to set
+# up the LaunchAgent. That deleted the plist template out from under
+# itself, so every real install failed at the "LaunchAgent plist template
+# not found" check below. A trap can't have that class of bug: it always
+# runs last, strictly after every use of $STAGING earlier in the script,
+# no matter which exit point is actually hit.
+trap 'rm -rf "$STAGING"' EXIT
+
 echo "postinstall: installing HAL driver..."
 
 if [ ! -d "$DRIVER_SRC" ]; then
@@ -58,10 +71,6 @@ chmod -R 755 "$DRIVER_DEST"
 
 echo "postinstall: restarting coreaudiod so the driver loads..."
 killall coreaudiod 2>/dev/null || true
-
-# Clean up the temporary staging payload now that the driver has been
-# relocated to its real destination.
-rm -rf "$STAGING"
 
 echo "postinstall: setting up the router daemon LaunchAgent for the logged-in user..."
 
