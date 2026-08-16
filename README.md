@@ -106,4 +106,4 @@ Run `./build/testtone --help` for the full flag list.
 
 ## License
 
-No license file is currently included — all rights reserved by default. Open an issue if you'd like to use this under a specific license.
+See [LICENSE.md](LICENSE.md). In short: free to use and contribute to, but no reselling and no re-publishing this project (or a modified version of it) under a different name or as your own.
