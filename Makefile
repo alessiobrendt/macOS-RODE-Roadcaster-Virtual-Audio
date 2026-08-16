@@ -40,6 +40,7 @@ INSTALLER_STAGING        := $(BUILD_DIR)/pkg-root
 INSTALLER_SCRIPTS_DIR    := $(INSTALLER_DIR)/scripts
 INSTALLER_RESOURCES_DIR  := $(INSTALLER_DIR)/resources
 INSTALLER_DISTRIBUTION   := $(INSTALLER_DIR)/distribution.xml
+INSTALLER_COMPONENT_PLIST := $(BUILD_DIR)/VAD-component.plist
 INSTALLER_COMPONENT_PKG  := $(BUILD_DIR)/VAD-component.pkg
 INSTALLER_PKG            := $(BUILD_DIR)/RodeCasterVirtualAudio-Installer.pkg
 INSTALLER_APP_IDENTIFIER := com.abrendt.rodecastervad.pkg.app
@@ -220,6 +221,24 @@ verify: $(BUNDLE)
 # go until the postinstall script runs as root and can determine the
 # actual console user).
 #
+# IMPORTANT -- BundleIsRelocatable=false: by default, pkgbuild/Installer.app
+# will "relocate" an install to match any EXISTING copy of a bundle with
+# the same CFBundleIdentifier found anywhere on disk (documented, intentional
+# behavior, for updating existing installs in place). Since this dev
+# checkout always has its own build/VAD.app on disk (same bundle ID,
+# com.abrendt.rodecastervad.gui, as the payload), a live install attempt
+# was relocated INTO build/VAD.app instead of /Applications -- which broke
+# the postinstall script's hardcoded /Applications/VAD.app path assumption
+# and correctly made it fail loudly rather than proceed with a broken
+# setup. Fix: generate a component plist via `pkgbuild --analyze`, force
+# BundleIsRelocatable=false on the VAD.app entry (installer/scripts/
+# patch-component-plist.py, matched by RootRelativeBundlePath rather than
+# array index so it isn't order-dependent), and pass that plist to
+# `pkgbuild --component-plist` instead of relying on the default
+# auto-analyzed behavior. This plist is regenerated fresh on every
+# `make installer` run (not hand-maintained/committed) so it can never
+# drift out of sync with the actual payload.
+#
 # This is build+verify only -- `make installer` never runs/installs the
 # resulting .pkg. See README "Installer (.pkg)" for the manual, deliberate
 # double-click-to-install step and its safety notes.
@@ -230,8 +249,13 @@ installer: everything
 	cp -R $(GUI_APP) $(INSTALLER_STAGING)/$(GUI_PRODUCT).app
 	cp -R $(BUNDLE) $(INSTALLER_STAGING)/.rodecaster-payload/$(PRODUCT_NAME).driver
 	cp daemon/com.abrendt.rodevad.router.plist $(INSTALLER_STAGING)/.rodecaster-payload/com.abrendt.rodevad.router.plist
+	@echo "--- generating + patching component plist (BundleIsRelocatable=false for VAD.app) ---"
+	rm -f $(INSTALLER_COMPONENT_PLIST)
+	pkgbuild --analyze --root $(INSTALLER_STAGING) $(INSTALLER_COMPONENT_PLIST)
+	python3 $(INSTALLER_SCRIPTS_DIR)/patch-component-plist.py $(INSTALLER_COMPONENT_PLIST)
 	@echo "--- building component package (pkgbuild) ---"
 	pkgbuild --root $(INSTALLER_STAGING) \
+	         --component-plist $(INSTALLER_COMPONENT_PLIST) \
 	         --install-location /Applications \
 	         --identifier $(INSTALLER_APP_IDENTIFIER) \
 	         --version $(INSTALLER_VERSION) \
