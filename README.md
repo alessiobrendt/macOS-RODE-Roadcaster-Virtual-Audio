@@ -52,7 +52,16 @@ The app never reimplements audio playback or device enumeration itself — every
 
 ## Install
 
-Download the latest [`.pkg` installer](../../releases/latest) and double-click it. Since this isn't signed with a paid Apple Developer ID, macOS Gatekeeper will flag it as from an unidentified developer — right-click the file and choose **Open** to proceed anyway.
+**Option A — Homebrew:**
+
+```
+brew tap alessiobrendt/vad
+brew install --cask vad
+```
+
+**Option B — manual download:** get the latest [`.pkg` installer](../../releases/latest) and double-click it.
+
+Either way, since this isn't signed with a paid Apple Developer ID, macOS Gatekeeper will flag it as from an unidentified developer — right-click the file and choose **Open** to proceed anyway.
 
 The installer sets up everything in one step: the driver (`/Library/Audio/Plug-Ins/HAL/`), the app (`/Applications/VAD.app`), and the routing daemon (a per-user LaunchAgent, no `sudo` needed for that part).
 
