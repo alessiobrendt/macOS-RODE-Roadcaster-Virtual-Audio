@@ -3,7 +3,7 @@ import SwiftUI
 @main
 struct RodeVADTesterApp: App {
     var body: some Scene {
-        WindowGroup("RodeCaster Virtual Audio Tester") {
+        WindowGroup("VAD — Virtual Audio Driver") {
             AppShellView()
         }
         // .contentSize resizability doesn't fit a tabbed control-surface

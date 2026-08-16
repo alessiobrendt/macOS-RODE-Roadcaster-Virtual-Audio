@@ -1,20 +1,23 @@
 import SwiftUI
 
 /// The app's top-level shell: owns the shared @StateObject instances
-/// (DeviceStore, DaemonController, ChannelMapStore), injects them via
-/// .environmentObject so every tab sees the same live state rather than
-/// each tab keeping its own disconnected copy, and hosts the TabView plus
-/// a toolbar with the donate button.
+/// (DeviceStore, DaemonController, ChannelMapStore, RestartController),
+/// injects them via .environmentObject so every tab sees the same live
+/// state rather than each tab keeping its own disconnected copy, and
+/// hosts the TabView plus a toolbar with the donate button.
 ///
-/// LevelsPoller is deliberately NOT created/owned here -- it's scoped to
-/// just the Levels tab (created as that tab's own @StateObject in
-/// MetersView) since it's the one piece of state that only matters, and
-/// should only be actively polling, while that specific tab is visible.
+/// LevelsPoller is the one exception: it's still owned/injected here (so
+/// its type is known app-wide, same wiring pattern as everything else),
+/// but only MetersView ever calls start()/stop() on it -- from its own
+/// onAppear/onDisappear -- so it only actively polls state/rodevad-router.levels
+/// while the Levels tab specifically is visible, not for the app's whole
+/// lifetime.
 struct AppShellView: View {
     @StateObject private var deviceStore = DeviceStore()
     @StateObject private var daemonController = DaemonController()
     @StateObject private var channelMapStore = ChannelMapStore()
     @StateObject private var levelsPoller = LevelsPoller()
+    @StateObject private var restartController = RestartController()
 
     var body: some View {
         TabView {
@@ -32,6 +35,9 @@ struct AppShellView: View {
 
             DaemonControlView()
                 .tabItem { Label("Daemon", systemImage: "gearshape.2.fill") }
+
+            RestartView()
+                .tabItem { Label("Restart", systemImage: "arrow.triangle.2.circlepath") }
         }
         .toolbar {
             ToolbarItem(placement: .automatic) {
@@ -42,6 +48,7 @@ struct AppShellView: View {
         .environmentObject(daemonController)
         .environmentObject(channelMapStore)
         .environmentObject(levelsPoller)
+        .environmentObject(restartController)
         .frame(minWidth: 560, minHeight: 460)
     }
 }

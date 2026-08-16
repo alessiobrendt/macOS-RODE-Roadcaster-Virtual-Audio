@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="1">
+    <title>RodeCaster Virtual Audio Driver (VAD)</title>
+    <organization>com.abrendt</organization>
+    <domains enable_localSystem="true"/>
+    <options customize="never" require-scripts="false" rootVolumeOnly="true"/>
+
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+
+    <choices-outline>
+        <line choice="default">
+            <line choice="com.abrendt.rodecastervad.pkg.app"/>
+        </line>
+    </choices-outline>
+
+    <choice id="default"/>
+    <choice id="com.abrendt.rodecastervad.pkg.app" visible="false" title="VAD + RodeCaster HAL driver">
+        <pkg-ref id="com.abrendt.rodecastervad.pkg.app"/>
+    </choice>
+
+    <pkg-ref id="com.abrendt.rodecastervad.pkg.app" version="1.0.0" onConclusion="none">VAD-component.pkg</pkg-ref>
+</installer-gui-script>

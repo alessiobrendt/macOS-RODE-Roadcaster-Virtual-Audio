@@ -1,0 +1,150 @@
+#!/bin/bash
+#
+# postinstall
+#
+# Runs as ROOT during a `RodeCasterVirtualAudio-Installer.pkg` install
+# (see ../../Makefile's `installer` target, which builds this .pkg via
+# pkgbuild + productbuild). This is the ONLY place in this whole project
+# that performs a full, non-interactive system install -- the standalone
+# install.sh / install-daemon.sh scripts stay interactive (they prompt for
+# confirmation) and are meant to be run manually by a human; a pkg
+# postinstall script cannot prompt, so the Installer.app's own UI (which
+# the user already clicked through: Introduction -> Install -> admin
+# password) IS the confirmation here.
+#
+# What this does, in order:
+#   1. Moves the driver bundle from its temporary staging location
+#      (installed alongside the .app as a payload side-effect -- see the
+#      Makefile's payload layout) to its real location,
+#      /Library/Audio/Plug-Ins/HAL/, with root:wheel ownership -- the
+#      same end state install.sh produces manually.
+#   2. Restarts coreaudiod so it loads the driver immediately.
+#   3. Sets up the per-user LaunchAgent for rodevad-router, targeting the
+#      *console user* (the person actually logged into the GUI session),
+#      not root -- this script runs as root, but the LaunchAgent must
+#      belong to and run as the real user, using the standard macOS
+#      installer idiom for this (`stat -f%Su /dev/console` to find who's
+#      logged in, then `launchctl bootstrap gui/<uid>` to load a LaunchAgent
+#      into that specific user's GUI session from a root-context script).
+#
+# Fails loudly (exit 1) on any step that can't complete, so the
+# Installer.app reports a failure rather than silently finishing with a
+# broken setup.
+
+set -u
+
+STAGING="/Applications/.rodecaster-payload"
+DRIVER_SRC="$STAGING/RodeCasterVirtualAudio.driver"
+DRIVER_DEST="/Library/Audio/Plug-Ins/HAL/RodeCasterVirtualAudio.driver"
+PLIST_TEMPLATE="$STAGING/com.abrendt.rodevad.router.plist"
+ROUTER_LABEL="com.abrendt.rodevad.router"
+
+echo "postinstall: installing HAL driver..."
+
+if [ ! -d "$DRIVER_SRC" ]; then
+    echo "postinstall: ERROR - expected driver payload not found at $DRIVER_SRC" >&2
+    exit 1
+fi
+
+mkdir -p /Library/Audio/Plug-Ins/HAL
+rm -rf "$DRIVER_DEST"
+cp -R "$DRIVER_SRC" "$DRIVER_DEST"
+if [ ! -d "$DRIVER_DEST" ]; then
+    echo "postinstall: ERROR - failed to copy driver to $DRIVER_DEST" >&2
+    exit 1
+fi
+chown -R root:wheel "$DRIVER_DEST"
+chmod -R 755 "$DRIVER_DEST"
+
+echo "postinstall: restarting coreaudiod so the driver loads..."
+killall coreaudiod 2>/dev/null || true
+
+# Clean up the temporary staging payload now that the driver has been
+# relocated to its real destination.
+rm -rf "$STAGING"
+
+echo "postinstall: setting up the router daemon LaunchAgent for the logged-in user..."
+
+CONSOLE_USER="$(stat -f%Su /dev/console 2>/dev/null || true)"
+if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ] || [ "$CONSOLE_USER" = "loginwindow" ]; then
+    echo "postinstall: WARNING - could not determine a logged-in console user (got \"$CONSOLE_USER\")." >&2
+    echo "postinstall: WARNING - skipping LaunchAgent setup. The driver IS installed and coreaudiod" >&2
+    echo "postinstall: WARNING - was restarted; run daemon/install-daemon.sh --router-bin" >&2
+    echo "postinstall: WARNING - /Applications/VAD.app/Contents/MacOS/rodevad-router --working-dir" >&2
+    echo "postinstall: WARNING - \"\$HOME/Library/Application Support/RodeCasterVirtualAudio\" manually," >&2
+    echo "postinstall: WARNING - as that user, once logged in." >&2
+    exit 0
+fi
+
+CONSOLE_UID="$(id -u "$CONSOLE_USER" 2>/dev/null || true)"
+CONSOLE_HOME="$(dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+
+if [ -z "$CONSOLE_UID" ] || [ -z "$CONSOLE_HOME" ]; then
+    echo "postinstall: ERROR - could not resolve uid/home directory for console user \"$CONSOLE_USER\"" >&2
+    exit 1
+fi
+
+APP_SUPPORT_DIR="$CONSOLE_HOME/Library/Application Support/RodeCasterVirtualAudio"
+STATE_DIR="$APP_SUPPORT_DIR/state"
+CONFIG_DIR="$APP_SUPPORT_DIR/config"
+LOGS_DIR="$APP_SUPPORT_DIR/logs"
+ROUTER_BIN="/Applications/VAD.app/Contents/MacOS/rodevad-router"
+
+mkdir -p "$STATE_DIR" "$CONFIG_DIR" "$LOGS_DIR"
+chown -R "$CONSOLE_USER":staff "$APP_SUPPORT_DIR"
+
+if [ ! -x "$ROUTER_BIN" ]; then
+    echo "postinstall: ERROR - expected router binary not found at $ROUTER_BIN (app bundle should have it embedded)" >&2
+    exit 1
+fi
+
+if [ ! -f "$PLIST_TEMPLATE" ]; then
+    echo "postinstall: ERROR - expected LaunchAgent plist template not found at $PLIST_TEMPLATE" >&2
+    exit 1
+fi
+
+LAUNCH_AGENTS_DIR="$CONSOLE_HOME/Library/LaunchAgents"
+mkdir -p "$LAUNCH_AGENTS_DIR"
+chown "$CONSOLE_USER":staff "$LAUNCH_AGENTS_DIR"
+PLIST_DEST="$LAUNCH_AGENTS_DIR/${ROUTER_LABEL}.plist"
+
+# Same template + substitution pattern daemon/install-daemon.sh uses --
+# single source of truth for the plist's structure, just filled in with
+# the installed-app paths instead of a dev checkout's paths.
+sed -e "s#__ROUTER_BIN_PATH__#${ROUTER_BIN}#g" \
+    -e "s#__STDOUT_LOG__#${LOGS_DIR}/rodevad-router.out.log#g" \
+    -e "s#__STDERR_LOG__#${LOGS_DIR}/rodevad-router.err.log#g" \
+    -e "s#__WORKING_DIR__#${APP_SUPPORT_DIR}#g" \
+    "$PLIST_TEMPLATE" > "$PLIST_DEST"
+
+chown "$CONSOLE_USER":staff "$PLIST_DEST"
+
+if ! plutil -lint "$PLIST_DEST" >/dev/null 2>&1; then
+    echo "postinstall: ERROR - generated LaunchAgent plist at $PLIST_DEST is not valid" >&2
+    exit 1
+fi
+
+echo "postinstall: loading the LaunchAgent for uid $CONSOLE_UID ($CONSOLE_USER)..."
+
+# Unload any stale prior copy first (harmless if nothing is loaded).
+launchctl bootout "gui/$CONSOLE_UID" "$PLIST_DEST" >/dev/null 2>&1 || true
+
+if launchctl bootstrap "gui/$CONSOLE_UID" "$PLIST_DEST" 2>/tmp/rodevad-postinstall-bootstrap-err.$$; then
+    echo "postinstall: LaunchAgent loaded via launchctl bootstrap."
+    rm -f /tmp/rodevad-postinstall-bootstrap-err.$$
+else
+    echo "postinstall: launchctl bootstrap failed, trying sudo -u launchctl load fallback..." >&2
+    cat /tmp/rodevad-postinstall-bootstrap-err.$$ >&2 2>/dev/null || true
+    rm -f /tmp/rodevad-postinstall-bootstrap-err.$$
+    if sudo -u "$CONSOLE_USER" launchctl load "$PLIST_DEST"; then
+        echo "postinstall: LaunchAgent loaded via sudo -u launchctl load."
+    else
+        echo "postinstall: ERROR - could not load the LaunchAgent for $CONSOLE_USER by either method." >&2
+        echo "postinstall: ERROR - the plist is in place at $PLIST_DEST; the user can load it manually:" >&2
+        echo "postinstall: ERROR -   launchctl load \"$PLIST_DEST\"" >&2
+        exit 1
+    fi
+fi
+
+echo "postinstall: done."
+exit 0

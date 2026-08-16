@@ -10,12 +10,13 @@ import SwiftUI
 struct DashboardView: View {
     @EnvironmentObject var deviceStore: DeviceStore
     @EnvironmentObject var daemonController: DaemonController
+    @StateObject private var loginItemController = LoginItemController()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Dashboard")
                 .font(.title2).bold()
-            Text("At-a-glance status of every piece of the RodeCaster Virtual Audio replacement.")
+            Text("VAD — Virtual Audio Driver: at-a-glance status of every piece of the RodeCaster virtual audio replacement.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
 
@@ -45,11 +46,43 @@ struct DashboardView: View {
                 )
             }
 
+            loginItemSection
+
             Spacer()
         }
         .padding(20)
         .frame(minWidth: 480, minHeight: 360)
-        .onAppear { deviceStore.refresh() }
+        .onAppear {
+            deviceStore.refresh()
+            loginItemController.refresh()
+        }
+    }
+
+    private var loginItemSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Toggle(isOn: Binding(
+                get: { loginItemController.isEnabled },
+                set: { loginItemController.setEnabled($0) }
+            )) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Launch VAD at Login")
+                        .font(.headline)
+                    Text("Uses SMAppService (macOS 13+) -- most reliable when VAD.app lives in /Applications (see the .pkg installer); toggling while running from build/ still works but a login item pointing at a dev build/ path can end up stale after a rebuild.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            if let error = loginItemController.errorMessage {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
+                    Text(error).font(.caption).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .padding(10)
+        .background(Color.gray.opacity(0.06))
+        .cornerRadius(8)
     }
 
     private var isDaemonRunning: Bool {

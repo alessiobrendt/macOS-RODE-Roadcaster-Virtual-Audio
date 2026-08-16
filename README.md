@@ -362,19 +362,25 @@ scraping the human-readable `--list` table.
 ### GUI
 
 For clicking buttons instead of typing commands, there's a small native
-SwiftUI app, **RodeCaster VAD Tester**, under `gui/RodeVADTester/`. It has
-grown from a single test-tone panel into the full control surface for this
-project: 5 tabs -- **Dashboard**, **Channel Test**, **Levels**, **Channel
-Mapping**, and **Daemon** -- all sharing one live app state
-(`AppShellView` owns `DeviceStore`, `DaemonController`, and
-`ChannelMapStore` as `@StateObject`s, injected into every tab via
-`.environmentObject`). It never reimplements audio playback or CoreAudio
-device enumeration in Swift: every "Play" button still shells out to the
-already-verified `testtone` binary, and the Dashboard/Channel Test tabs
-still read device info via `testtone --list-machine`.
+SwiftUI app, **VAD** (short for "Virtual Audio Driver" -- the app started
+life as "RodeVADTester", a single test-tone panel, and has since grown
+into the full control surface for this project, so it was renamed to
+reflect that; see "Renaming RodeVADTester -> VAD" below for exactly what
+did and didn't change). Source lives under `gui/RodeVADTester/` (the
+source directory itself was deliberately *not* renamed -- see that same
+section for why) and builds to `build/VAD.app`. It has 6 tabs --
+**Dashboard**, **Channel Test**, **Levels**, **Channel Mapping**,
+**Daemon**, and **Restart** -- all sharing one live app state
+(`AppShellView` owns `DeviceStore`, `DaemonController`, `ChannelMapStore`,
+`LevelsPoller`, and `RestartController` as `@StateObject`s, injected into
+every tab via `.environmentObject`). It never reimplements audio playback
+or CoreAudio device enumeration in Swift: every "Play" button still shells
+out to the already-verified `testtone` binary, and the Dashboard/Channel
+Test tabs still read device info via `testtone --list-machine`.
 
 Build it (implies `make testtone daemon` first, since the GUI shells out to
-both binaries):
+both binaries, and now embeds copies of both inside itself too -- see
+"Self-contained bundle" below):
 
 ```
 make gui
@@ -382,19 +388,48 @@ make gui
 
 This runs `swift build` (Swift Package Manager, no Xcode.app or `#Preview`
 required -- only the Command Line Tools' Swift toolchain) and
-hand-assembles the result into `build/RodeVADTester.app`, then runs the
-same style of verification as the driver bundle: `plutil -lint` on its
-`Info.plist`, ad-hoc `codesign`, and an `otool -L` check that the
+hand-assembles the result into `build/VAD.app`, then runs the same style
+of verification as the driver bundle: `plutil -lint` on its `Info.plist`,
+a check that the embedded `testtone`/`rodevad-router` binaries are present
+and executable, ad-hoc `codesign`, and an `otool -L` check that the
 executable actually links `SwiftUI`/`AppKit`.
 
 Launch it:
 
 ```
-open build/RodeVADTester.app
+open build/VAD.app
 ```
 
 or run the executable directly to see console output/errors:
-`./build/RodeVADTester.app/Contents/MacOS/RodeVADTester`.
+`./build/VAD.app/Contents/MacOS/VAD`.
+
+#### Self-contained bundle
+
+`build/VAD.app` is self-contained: `make gui`'s bundle-assembly step
+copies `testtone` and `rodevad-router` INSIDE it
+(`Contents/MacOS/testtone`, `Contents/MacOS/rodevad-router`), in addition
+to leaving the original loose `build/testtone` and `build/rodevad-router`
+binaries in place (still useful for the CLI-only dev workflow, e.g.
+`./build/testtone --list` directly from a terminal). This is what makes
+`VAD.app` relocatable to `/Applications` -- see "Installer (.pkg)" below --
+without needing its helper binaries to sit next to it as loose sibling
+files. `ProjectLayout.swift`'s binary resolution reflects this priority
+order: (1) embedded inside the running app bundle's own
+`Contents/MacOS/`, (2) the sibling-of-bundle `build/<name>` location (the
+original dev-checkout layout), (3) the dev-mode CWD-walk fallback already
+built into `projectRoot()`. Only case 1 is new; cases 2 and 3 are exactly
+the pre-existing behavior, so this is fully backward compatible with the
+original dev workflow (nothing regresses for `swift run`/using `build/`
+directly during development).
+
+`ProjectLayout.swift`'s runtime-data directories (`state/`, `config/`,
+`logs/`) also gained a similar preference: they resolve to `~/Library/
+Application Support/RodeCasterVirtualAudio/<name>` if that directory
+already exists (meaning a proper `.pkg` install has set up a daemon
+writing there), falling back to the project-relative `<projectRoot>/<name>`
+directory otherwise -- a pure existence check, not a hardcoded "am I
+installed" flag, so the same `VAD.app` binary works correctly whether
+it's the original dev-checkout copy or a `/Applications`-installed one.
 
 **Dashboard** -- at-a-glance status, no polling of its own: HAL driver
 installed (`HALDriverCheck`, a one-line `FileManager` existence check
@@ -404,11 +439,34 @@ RodeCaster Multitrack device connected (`DeviceStore.multitrackDevice`,
 matched by UID substring `"RODECaster Pro II"`, the same convention the
 daemon itself uses), all 5 `RVAD *` devices visible
 (`DeviceStore.rvadDeviceCount`), and daemon status (from `DaemonController`,
-which is already polling while this tab is open).
+which is already polling while this tab is open). Also has a **"Launch
+VAD at Login"** toggle (`LoginItemController`, wrapping `SMAppService.mainApp`,
+macOS 13+, no new dependency) that reflects and controls whether the app
+itself opens automatically at login -- always shows the *actual* current
+registration status rather than tracking local UI state, so it stays
+correct even if you change this via System Settings > General > Login
+Items directly instead. This is unrelated to the router daemon's own
+LaunchAgent, which starts on its own regardless of this toggle. Most
+reliable when `VAD.app` lives in a stable location like `/Applications`
+(see "Installer (.pkg)" below) -- toggling while running from `build/`
+during development still works, but a login item registered against a dev
+`build/` path can end up stale after a rebuild moves/replaces that binary.
 
 **Channel Test** -- the original per-channel test-tone panel (renamed from
 `ContentView`/"RodeCaster Virtual Audio — Channel Tester" to
-`ChannelTesterView`/"Channel Test"), unchanged in behavior.
+`ChannelTesterView`/"Channel Test"), plus an **Auto Test** mode: plays
+every channel of the selected device in sequence (channel 1, then 2, ...)
+with a 0.4s gap between channels (`autoTestGapSeconds`), reusing the exact
+same `playingChannels`/`channelStatus` state the manual per-row Play
+buttons use -- a row shows "Playing…" identically whether started
+manually or by Auto Test, no separate parallel UI state. The button toggles
+to **Stop** while running; stopping is cooperative (checked *between*
+channels via `Task.isCancelled`, never an abrupt kill mid-tone -- the
+in-flight `testtone` invocation for the current channel always finishes
+naturally). Manual Play buttons and the device picker are disabled while
+Auto Test runs; changing the selected device mid-sequence (or navigating
+away from the tab) stops it cleanly rather than continuing into a stale
+channel count.
 
 **Levels** -- live per-channel meters for all 5 devices (L/R, RMS fill +
 peak marker, color ramps green→yellow→red), reading
@@ -422,8 +480,16 @@ This is for "is there signal, roughly how hot" sanity-checking, not
 broadcast-grade metering.
 
 **Channel Mapping** -- 5 steppers (1-9) for each device's starting
-Multitrack channel, with inline red highlighting on any overlapping pair.
-Loads `config/channel-map.conf` if present, else falls back to
+Multitrack channel, with inline red highlighting on any overlapping pair,
+plus a **"Reset to Defaults"** button (`ChannelMapStore.resetToDefaults()`)
+that snaps all 5 steppers back to the compiled-in defaults
+(system=1/game=3/music=5/virtuala=7/virtualb=9). Reset is a **local edit
+only**, exactly like changing one Stepper by hand: it does not touch
+`config/channel-map.conf` on disk and does not restart the daemon by
+itself -- "Apply" is still required afterward to actually save and
+restart with the reset values, going through the exact same
+`hasUnsavedChanges`/`validationError` flow a manual edit would. Loads
+`config/channel-map.conf` if present, else falls back to
 `daemon/channel-map.example.conf` as a starting template. Client-side
 validation mirrors the daemon's own range/overlap rules purely for instant
 UX feedback -- **the daemon re-validates the saved file itself and refuses
@@ -446,9 +512,94 @@ informal and undocumented, so **the raw log tail is always shown alongside
 the derived status, never hidden behind it** -- judge for yourself rather
 than trusting the heuristic blindly.
 
+**Restart** -- a heavier hammer than the Daemon tab's own Start/Stop, for
+when the RVAD devices or routing get stuck in a way a plain daemon restart
+doesn't fix. Restarts macOS's `coreaudiod` itself (which reloads every HAL
+audio driver plug-in system-wide, including ours) and then the router
+daemon. This is the one action in the whole app that touches audio
+outside this project's own devices:
+
+- **Restarting `coreaudiod` briefly interrupts ALL audio on the Mac** --
+  every app, not just RodeCaster routing -- and requires administrator
+  privileges. It is gated behind an explicit confirmation dialog (never a
+  silent one-click action), matching the tone of `install-daemon.sh`'s own
+  safety notes.
+- Elevation is requested for exactly **one** command (`killall coreaudiod`)
+  via the standard macOS-native `osascript ... do shell script ... with
+  administrator privileges` pattern (`RestartController`), which shows the
+  normal native admin-password dialog -- this app never embeds a raw
+  `sudo` call or builds a custom password UI.
+- Sequenced and status-visible, not one opaque spinner (`RestartController.Phase`:
+  stopping the daemon → restarting `coreaudiod` → waiting for devices to
+  reappear (polls `testtone --list-machine` a few times, a second apart --
+  best-effort, since the daemon's own ~5-minute internal retry loop is the
+  real safety net here) → starting the daemon again), with each step's
+  outcome appended to a visible log. If the admin prompt is cancelled or
+  `coreaudiod` fails to restart, the sequence stops cleanly there rather
+  than blindly continuing.
+- **Never reinstalls or recopies the driver bundle** -- that stays
+  `install.sh`'s job, out of GUI scope. This only asks `coreaudiod` to
+  *reload* whatever is already installed at
+  `/Library/Audio/Plug-Ins/HAL/`.
+
 A pink heart **Donate** button lives in the toolbar (opens
 `https://www.paypal.com/paypalme/alessiobrendt` via `NSWorkspace`) --
 unobtrusive, never gates any functionality.
+
+### Renaming RodeVADTester -> VAD
+
+The app's user-visible name changed from "RodeVADTester" to **VAD**
+(display name "VAD — Virtual Audio Driver") once it grew from a single
+test-tone panel into the full control surface described above. What
+changed and what deliberately didn't:
+
+- **Changed**: `CFBundleName`/`CFBundleExecutable` ("VAD"),
+  `CFBundleDisplayName` ("VAD — Virtual Audio Driver"), the built artifact
+  path (`build/RodeVADTester.app` -> `build/VAD.app`), the window title,
+  the Dashboard header text, and the Swift Package's product/executable
+  target name in `Package.swift` (`RodeVADTester` -> `VAD`, so
+  `swift build` now produces `.build/release/VAD`).
+- **Deliberately left alone**: the bundle identifier
+  (`com.abrendt.rodecastervad.gui` -- an internal string, not user-facing;
+  changing it has more ripple effects for no visible benefit), the source
+  directory name (`gui/RodeVADTester/` -- renaming it would just churn
+  every file's location for a purely cosmetic reason), internal Swift
+  type/file names (`RodeVADTesterApp.swift`, `ChannelTesterView.swift`,
+  etc. -- not user-facing), and the daemon's own LaunchAgent label
+  (`com.abrendt.rodevad.router` -- a separate, unrelated identifier that
+  was never in scope for this rename).
+
+#### App icon
+
+The app has a real icon (a mixer-with-faders "VAD" design), not the
+generic default. Source of truth is a single 1024x1024 PNG at
+`gui/RodeVADTester/Resources/AppIconSource/icon-source.png`; the Makefile's
+`gui-icon` target (a prerequisite of `gui`, also runnable standalone) turns
+it into a proper `.iconset` using `sips` (Command Line Tools, no
+ImageMagick needed) at all 10 standard sizes (16 through 512@2x/1024), then
+`iconutil -c icns` collapses that into `gui/RodeVADTester/Resources/AppIcon.icns`.
+
+That generated `.icns` is **committed to the repo** (small, binary, same
+pattern as the other tracked `Resources/*.plist` files) rather than
+regenerated into `build/` on every run -- a fresh checkout doesn't need
+`sips`/`iconutil` to run just to build. It stays reproducible anyway: the
+Makefile rule is a normal file-dependency rule keyed on
+`icon-source.png`'s mtime, so `make` (or `make gui-icon` directly)
+automatically regenerates `AppIcon.icns` if the source PNG is ever
+replaced with an updated design, rather than silently building with a
+stale icon.
+
+`gui/RodeVADTester/Info.plist` declares `CFBundleIconFile` = `AppIcon`
+(the traditional key -- simple, and sufficient for an ad-hoc-signed local
+utility; no `.xcassets`/Asset Catalog needed since there's no Xcode
+project). The `gui` target's bundle-assembly step copies
+`AppIcon.icns` into `Contents/Resources/AppIcon.icns` (creating
+`Contents/Resources/` if needed), and `gui-verify` checks it's actually
+there and that `file` recognizes it as a `Mac OS X icon` before signing.
+
+See "Known issues" for the Finder/Dock icon-cache-refresh caveat --
+seeing the old/generic icon briefly after a rebuild is a macOS caching
+quirk, not a sign anything is wrong.
 
 The app is not installed anywhere system-wide -- it stays in `build/`
 alongside `testtone` and `rodevad-router`. `ProjectLayout.swift` is now the
@@ -677,8 +828,142 @@ stereo mix-down -- but the router daemon's `kChannelMap[]` and channel-count
 assumptions would need updating to match (it currently assumes
 `kNumberOfVirtualDevices x kChannelsPerVirtualDevice == 10`).
 
+## Installer (.pkg)
+
+A proper, double-clickable macOS installer package --
+`build/RodeCasterVirtualAudio-Installer.pkg` -- that installs everything
+in one step: the HAL driver, `VAD.app`, and the router daemon's LaunchAgent,
+using the native Installer.app wizard UI (Introduction/Install/Summary,
+plus a Welcome pane explaining what gets installed and a Conclusion pane
+with next steps). Built with `pkgbuild` + `productbuild`, both part of
+macOS itself -- no Xcode.app needed.
+
+### Build it
+
+```
+make installer
+```
+
+This runs `make everything` first (driver + `testtone` + daemon +
+self-contained `VAD.app`, fully built and verified per the sections
+above), then:
+
+1. **Stages a payload** at `build/pkg-root/`: `VAD.app` directly (installs
+   to `/Applications`), plus a hidden `.rodecaster-payload/` staging
+   folder containing the driver bundle and the LaunchAgent plist template
+   -- these aren't meant to land at that path permanently; the
+   postinstall script (below) relocates/consumes them and deletes the
+   staging folder.
+2. **`pkgbuild --root ... --install-location /Applications --scripts
+   installer/scripts`** builds the component package
+   (`build/VAD-component.pkg`), embedding `installer/scripts/postinstall`
+   to run after the payload is placed.
+3. **`productbuild --distribution installer/distribution.xml --resources
+   installer/resources`** wraps that component into the final
+   distribution package (`build/RodeCasterVirtualAudio-Installer.pkg`),
+   adding the Welcome/Conclusion panes.
+4. Runs `pkgutil --check-signature` on the result and prints what it
+   says (see "Signing" below -- reporting "no signature" here is expected
+   and not a build failure).
+
+### What `installer/scripts/postinstall` does (runs as root)
+
+This is the only place in the whole project that performs a full,
+non-interactive system install -- `install.sh`/`install-daemon.sh` stay
+interactive (they prompt for confirmation) for manual/dev use; a pkg
+postinstall script can't prompt, so the Installer.app's own UI (which the
+user already clicked through, including the admin password prompt) IS the
+confirmation.
+
+1. Moves the driver bundle from its temporary staging location to
+   `/Library/Audio/Plug-Ins/HAL/RodeCasterVirtualAudio.driver`, with
+   `root:wheel` ownership -- the same end state `install.sh` produces
+   manually.
+2. Restarts `coreaudiod` so the driver loads immediately (fine to do as
+   root in this context -- the Installer.app has already warned about
+   this in the Welcome pane).
+3. Sets up the per-user LaunchAgent for `rodevad-router`, targeting the
+   **console user** (the person actually logged into the GUI session),
+   not root: finds them via `stat -f%Su /dev/console`, resolves their
+   home directory via `dscl`, creates `~/Library/Application
+   Support/RodeCasterVirtualAudio/{state,config,logs}` owned by that user,
+   writes the LaunchAgent plist into *their* `~/Library/LaunchAgents/`
+   (reusing the exact same template + `sed` substitution pattern
+   `install-daemon.sh` uses, just filled in with the installed-app paths),
+   and loads it via `launchctl bootstrap gui/<uid>` (the modern
+   replacement for `launchctl load` in root-context installer scripts),
+   falling back to `sudo -u <user> launchctl load` if that fails.
+4. **Fails loudly** (nonzero exit) if the driver copy or LaunchAgent setup
+   fails, so the Installer.app shows a failure rather than silently
+   completing with a broken setup. If no console user can be determined
+   (edge case -- e.g. installing at the login screen before anyone signs
+   in), it warns and skips step 3 rather than failing the whole install,
+   since the driver + `coreaudiod` restart (steps 1-2) already succeeded
+   independently.
+
+### Signing
+
+This package is **ad-hoc signed** (no paid Apple Developer ID Installer
+certificate available in this environment) -- same caveat as the driver
+and the app bundle elsewhere in this project. `pkgutil --check-signature`
+on it reports:
+
+```
+Status: no signature
+```
+
+which is expected, not an error -- `make installer` deliberately doesn't
+treat that as a build failure. In practice this means **double-clicking
+the built .pkg will trigger a Gatekeeper "unidentified developer"
+warning** before macOS will run it. To proceed anyway: right-click (or
+Control-click) the .pkg in Finder and choose **Open**, or go to **System
+Settings > Privacy & Security** after the first blocked attempt and look
+for an "Open Anyway" button -- the same pattern already documented above
+for the HAL driver itself.
+
+### Verification performed (static only -- see below for why)
+
+- `make installer` builds cleanly end to end (driver, daemon, GUI, then
+  the two-stage `pkgbuild`/`productbuild` pkg build).
+- `pkgutil --check-signature` reports "no signature" as expected.
+- `pkgutil --expand-full` on the built `.pkg`, followed by manual
+  inspection: `Distribution` XML resolves correctly (title, welcome/
+  conclusion panes, `pkg-ref` pointing at the component package),
+  `PackageInfo` shows the correct `install-location="/Applications"` and
+  identifier, the payload contains `VAD.app` (with `testtone`/
+  `rodevad-router` embedded inside it) and the `.rodecaster-payload/`
+  staging content, and `installer/scripts/postinstall` is present with a
+  600-second timeout configured.
+- `bash -n installer/scripts/postinstall` (both the source file and the
+  copy inside the expanded `.pkg`) -- valid syntax.
+
+**This package has deliberately NOT been double-clicked/run for real in
+this session.** Doing so would install the driver system-wide with
+`sudo`-equivalent privileges, restart the live `coreaudiod`, and set up a
+brand-new LaunchAgent for the real logged-in user -- the same
+"build-and-statically-verify-only, real installation happens later with
+the user present" rule this whole project follows for anything touching
+live system state. See "Next manual steps" for the actual, deliberate
+install step.
+
 ## Known issues
 
+- **The Restart tab is the highest-blast-radius action in this app.**
+  Unlike everything else, restarting `coreaudiod` affects every audio app
+  on the Mac, not just this project, and needs an admin password. It's
+  gated behind a confirmation dialog for exactly this reason -- see
+  "Restart" under the GUI section above and the live-testing safety notes
+  under "Routing daemon" for the same underlying caution applied to a
+  bigger blast radius.
+- **"Launch VAD at Login" is most reliable once installed to
+  `/Applications`.** `SMAppService.mainApp` registers a login item pointed
+  at the app's current on-disk path; toggling it on while running
+  `build/VAD.app` during development works, but a subsequent `make clean`
+  + rebuild replaces that binary, and the previously-registered login item
+  can end up stale (pointing at a path that either no longer exists or now
+  holds an unrelated fresh build). The `.pkg`-installed
+  `/Applications/VAD.app` case doesn't have this problem, since that path
+  isn't touched by ordinary `make` runs in this project checkout.
 - **No per-app channel/volume controls exposed.** The device intentionally
   does not implement `AudioObjectPropertyControlList` entries (volume/mute
   controls) -- `kAudioObjectPropertyControlList` returns an empty list. This
@@ -701,14 +986,24 @@ assumptions would need updating to match (it currently assumes
   cannot be fully predicted or automated from this project; the exact
   wording and location of the "allow this extension" control has moved
   around between recent macOS versions.
-- **The GUI app must stay next to `testtone`.** `RodeVADTester.app` locates
-  the `testtone` binary as a sibling of the `.app` bundle (i.e. both must
-  live directly inside `build/`, which is exactly what `make gui` produces).
-  If you move the `.app` out of `build/` on its own, it will fail to find
-  `testtone` and show an error banner rather than silently doing nothing.
-  No app icon is bundled (falls back to the generic app icon), and it is
-  not code-signed with a Developer ID -- same ad-hoc-signing caveat as the
-  driver itself, and it is never installed outside `build/`.
+- **The GUI app is self-contained as of the bundle-embedding update** --
+  `VAD.app` carries its own copies of `testtone` and `rodevad-router`
+  inside `Contents/MacOS/`, so it's relocatable (e.g. to `/Applications`
+  via the `.pkg` installer) without needing loose sibling binaries next to
+  it. When running the unrelocated `build/VAD.app` straight out of
+  `build/` during development, `ProjectLayout` still also checks the
+  sibling-of-bundle and dev-CWD-walk locations as fallbacks, so the
+  original dev workflow is unaffected. It is not code-signed with a
+  Developer ID -- same ad-hoc-signing caveat as the driver itself and the
+  `.pkg` installer (see "Installer (.pkg)").
+- **App icon caching: it may not visually refresh immediately.** The app
+  now has a real icon (see "App icon" below), but macOS aggressively caches
+  app icons by bundle identifier at the Finder/Dock/LaunchServices level.
+  If you rebuild after changing the icon and the old (or generic) icon
+  still shows in Finder/Dock, that's a macOS caching quirk, not a build
+  problem -- quit and relaunch the app, or as a last resort
+  `killall Dock` and/or `killall Finder` (both just restart those
+  background processes, no data loss) to force the cache to refresh.
 - **No SwiftUI `#Preview` support in this build.** Xcode's `#Preview` macro
   requires a plugin (`PreviewsMacros`) that only ships with Xcode.app, not
   the bare Command Line Tools, so it was removed from `ContentView.swift`.
@@ -794,6 +1089,21 @@ All of these were run locally as part of building this project (see
 | `rodevad-router --selftest`: `LoadChannelMapFromConfig` accept/reject cases (missing, valid, overlapping, out-of-range, missing key) | All correct, using temp files under `/tmp`, never the real `config/channel-map.conf` |
 | Full clean `swift build` (deleted `.build`/`.swiftpm` first) | Pass, 0 warnings |
 | GUI `nonisolated` actor-isolation cleanup (Swift 5 language mode; would be hard errors under Swift 6) | Fixed, 0 warnings remain |
+| `make gui-icon` (sips + iconutil, 10 sizes) | Generates a valid `.icns`; `make gui-icon` re-run with unchanged source correctly no-ops (`make: Nothing to be done`) |
+| `file Contents/Resources/AppIcon.icns` | `Mac OS X icon, ... "ic12" type` |
+| `codesign -dv` on GUI app after icon embedding | `Sealed Resources ... files=1` (icon sealed into signature) |
+| GUI rebuild with Reset to Defaults (Channel Mapping) | Full clean `swift build`, 0 warnings |
+| GUI rebuild with Restart tab (`RestartController`/`RestartView`) | Full clean `swift build`, 0 warnings |
+| GUI rebuild with Auto Test mode (`ChannelTesterView`) | Full clean `swift build`, 0 warnings |
+| `make gui` after bundle self-containment (embed testtone/rodevad-router) | Pass; `codesign --verify --deep --strict` on the bundle exits 0 |
+| Embedded `testtone`/`rodevad-router` individually via `codesign -dv` | Both show `Signature=adhoc` (re-signed correctly by the outer `--deep` bundle sign) |
+| `install-daemon.sh` no-args behavior after `--router-bin`/`--working-dir` parameterization | `bash -n` valid; default paths traced through manually -- identical to pre-change behavior |
+| GUI rebuild after RodeVADTester -> VAD rename (Package.swift, Info.plist, Makefile) | Full clean `swift build`: `Compiling VAD ...` / `Linking VAD`; 0 warnings |
+| `make installer` (pkgbuild + productbuild) | Builds `build/RodeCasterVirtualAudio-Installer.pkg` successfully |
+| `pkgutil --check-signature` on the installer .pkg | `Status: no signature` (expected/ad-hoc; documented, not treated as a build failure) |
+| `pkgutil --expand-full` + manual inspection (Distribution, PackageInfo, Payload, Scripts) | Structurally correct: correct install-location/identifier, `VAD.app` + staged driver + plist template present |
+| `bash -n installer/scripts/postinstall` (source and expanded-pkg copy) | Valid syntax |
+| Live daemon process survived `make clean` + full rebuild of `build/` | Confirmed: same PID throughout (no restart), matching Unix unlink-while-open semantics |
 
 By the time this round of work started, the HAL driver and `rodevad-router`
 were **already installed and running live** against real RodeCaster Pro 2
@@ -806,7 +1116,10 @@ re-installing anything live, per this round's explicit constraints.
 **Not done this round, by design:** actually running the new
 `rodevad-router` build against the live Multitrack hardware, installing the
 new GUI's channel-map changes via its "Apply" button, clicking through the
-GUI at all, or touching the live LaunchAgent (`launchctl load`/`unload`/
+GUI at all (including the Restart tab's `coreaudiod` restart, the Auto
+Test sequence, or the Login Item toggle -- `SMAppService.mainApp.register()`
+was never called for real), double-clicking/running the built `.pkg`
+installer, or touching the live LaunchAgent (`launchctl load`/`unload`/
 `kickstart`, or overwriting `~/Library/LaunchAgents/com.abrendt.rodevad.router.plist`).
 See "Next manual steps" for what that requires.
 
@@ -865,23 +1178,29 @@ RodeCasterVirtualAudio/
 ├── tools/
 │   └── testtone.c                 # CLI: list devices / play test tone to device+channel
 ├── gui/
-│   └── RodeVADTester/              # SwiftUI control-surface GUI (Swift Package)
-│       ├── Package.swift
-│       ├── Info.plist              # Info.plist for the hand-assembled .app bundle
+│   └── RodeVADTester/              # SwiftUI control-surface GUI (Swift Package; dir name kept, see "Renaming" above)
+│       ├── Package.swift            # product/executable target renamed to "VAD"
+│       ├── Info.plist              # Info.plist for the hand-assembled .app bundle (incl. CFBundleIconFile)
+│       ├── Resources/
+│       │   ├── AppIconSource/icon-source.png  # 1024x1024 source, single source of truth for the icon
+│       │   └── AppIcon.icns                    # generated by `make gui-icon`; committed to the repo
 │       └── Sources/RodeVADTester/
 │           ├── RodeVADTesterApp.swift    # @main, hosts AppShellView
 │           ├── AppShellView.swift        # owns shared state, TabView, toolbar/donate button
 │           ├── ProjectLayout.swift       # single source of truth for every on-disk path
-│           ├── DashboardView.swift       # at-a-glance status tab
-│           ├── ChannelTesterView.swift   # per-channel test-tone tab (was ContentView)
+│           ├── DashboardView.swift       # at-a-glance status tab + Launch at Login toggle
+│           ├── LoginItemController.swift # SMAppService.mainApp wrapper ("Launch at Login")
+│           ├── ChannelTesterView.swift   # per-channel test-tone tab (was ContentView) + Auto Test
 │           ├── MetersView.swift          # live level meters tab
 │           ├── LevelMeterView.swift      # dependency-free RMS+peak bar
 │           ├── LevelsPoller.swift        # polls state/rodevad-router.levels, tab-scoped
-│           ├── ChannelMapEditorView.swift # channel-mapping editor tab
-│           ├── ChannelMapStore.swift     # config/channel-map.conf load/save/validate/apply
+│           ├── ChannelMapEditorView.swift # channel-mapping editor tab + Reset to Defaults
+│           ├── ChannelMapStore.swift     # config/channel-map.conf load/save/validate/apply/reset
 │           ├── DaemonControlView.swift   # daemon start/stop/status/log tab
 │           ├── DaemonController.swift    # shells out to install/uninstall-daemon.sh, launchctl status
 │           ├── DaemonLogTail.swift       # cheap seek-from-end log tailing
+│           ├── RestartView.swift         # Restart tab (coreaudiod + daemon restart)
+│           ├── RestartController.swift   # the restart sequence + osascript admin-privileged step
 │           ├── HALDriverCheck.swift      # read-only HAL driver install check
 │           ├── DonateButton.swift        # pink heart -> PayPal
 │           ├── DeviceStore.swift
@@ -892,12 +1211,18 @@ RodeCasterVirtualAudio/
 │   ├── rodevad-router.c                     # the routing daemon (standalone binary)
 │   ├── channel-map.example.conf             # documented format/defaults + GUI fallback template
 │   ├── com.abrendt.rodevad.router.plist     # LaunchAgent template (placeholders filled at install time)
-│   ├── install-daemon.sh                    # per-user install (sed-resolves plist, launchctl load) -- not run automatically
+│   ├── install-daemon.sh                    # per-user install; --router-bin/--working-dir params -- not run automatically
 │   └── uninstall-daemon.sh                  # launchctl unload + remove -- not run automatically
-├── logs/                           # created by install-daemon.sh; rodevad-router's stdout/stderr
-├── state/                          # created by rodevad-router itself; rodevad-router.levels
-├── config/                         # created by install-daemon.sh; channel-map.conf (optional override)
-└── build/                         # created by `make`/`make gui`/`make daemon`; gitignored-worthy output
+├── installer/                       # the .pkg installer (see "Installer (.pkg)")
+│   ├── distribution.xml             # productbuild distribution: title, welcome/conclusion, pkg-ref
+│   ├── scripts/postinstall          # root-context: driver copy, coreaudiod restart, LaunchAgent setup
+│   └── resources/
+│       ├── welcome.html
+│       └── conclusion.html
+├── logs/                           # created by install-daemon.sh (dev mode); rodevad-router's stdout/stderr
+├── state/                          # created by rodevad-router itself (dev mode); rodevad-router.levels
+├── config/                         # created by install-daemon.sh (dev mode); channel-map.conf (optional override)
+└── build/                         # created by `make`/`make gui`/`make daemon`/`make installer`; gitignored-worthy output
     ├── RodeCasterVirtualAudio.driver/
     │   └── Contents/
     │       ├── Info.plist
@@ -905,10 +1230,16 @@ RodeCasterVirtualAudio/
     │       └── version.plist
     ├── testtone
     ├── rodevad-router
-    ├── RodeVADTester.app/
+    ├── VAD.app/
     │   └── Contents/
     │       ├── Info.plist
-    │       └── MacOS/RodeVADTester
+    │       ├── Resources/AppIcon.icns
+    │       └── MacOS/
+    │           ├── VAD
+    │           ├── testtone            # embedded copy (self-contained bundle)
+    │           └── rodevad-router      # embedded copy (self-contained bundle)
+    ├── VAD-component.pkg              # intermediate pkgbuild output
+    ├── RodeCasterVirtualAudio-Installer.pkg  # final productbuild output -- the double-clickable installer
     └── test_harness (if built manually)
 ```
 
@@ -916,21 +1247,27 @@ RodeCasterVirtualAudio/
 
 **Current state as of this round:** the HAL driver (5 `RVAD *` devices) and
 `rodevad-router` are already installed and **running live** against real
-RodeCaster Pro 2 hardware. This round added GUI tabs (Dashboard, Levels,
-Channel Mapping, Daemon) and daemon-side support for them (level metering,
-runtime channel-map config) -- built, self-tested, and statically verified,
-but **not yet run live**, and the live LaunchAgent/process were
-deliberately left completely untouched throughout this round (no
-`launchctl load`/`unload`/`kickstart`, no edits to the installed
-`~/Library/LaunchAgents/com.abrendt.rodevad.router.plist`). **This needs
-the coordinator and user present together, watching/listening** -- not run
-autonomously.
+RodeCaster Pro 2 hardware, from this dev checkout (not yet from a `.pkg`
+install). This round added: GUI tabs (Dashboard w/ Login Item toggle,
+Levels, Channel Mapping w/ Reset to Defaults, Daemon, Restart), Auto Test
+mode on Channel Test, a real app icon, the RodeVADTester -> VAD rename, a
+self-contained app bundle, and a full `.pkg` installer -- all built,
+self-tested, and statically verified, but **none of it run live**, and the
+live LaunchAgent/process were deliberately left completely untouched
+throughout (no `launchctl load`/`unload`/`kickstart`, no edits to the
+installed `~/Library/LaunchAgents/com.abrendt.rodevad.router.plist`, no
+`.pkg` double-clicked, no `SMAppService.mainApp.register()` call made).
+**This needs the coordinator and user present together, watching/listening
+for anything that touches real audio** -- not run autonomously.
+
+### A. Continue in dev-checkout mode (lower-risk, incremental)
 
 1. Read "Verification results" above's safety note about the live daemon
    process and `KeepAlive` before doing anything else -- `build/rodevad-router`
    already has this round's new code sitting at the same path the live
    process was launched from; the live process itself is unaffected
-   (still running the old, proven code from memory), but a crash/restart
+   (still running the old, proven code from memory -- confirmed to survive
+   even a full `make clean` + rebuild this round), but a crash/restart
    before you're ready would auto-load the new build via `KeepAlive`.
 2. When ready to test the new build deliberately (not by accident): with
    volume turned down, either let the current live process keep running
@@ -946,26 +1283,86 @@ autonomously.
 4. Confirm `state/rodevad-router.levels` is being rewritten roughly every
    75ms (`watch -n 0.2 cat state/rodevad-router.levels` or similar) --
    this is what the GUI's Levels tab reads.
-5. `make gui && open build/RodeVADTester.app` -- launch the expanded GUI
-   yourself (this was deliberately not done for you this round). Check:
-   - **Dashboard**: all 4 status rows show green/good.
+5. `make gui && open build/VAD.app` -- launch the GUI yourself (this was
+   deliberately not done for you this round). Check:
+   - **Dashboard**: all 4 status rows show green/good; try the "Launch
+     VAD at Login" toggle (low-risk -- it only registers/unregisters a
+     login item, doesn't touch audio) and confirm it reflects reality in
+     System Settings > General > Login Items.
+   - **Channel Test**: try **Auto Test** -- this is low-risk, same
+     playback primitive as the already-tested manual Play button, fine to
+     try whenever convenient (unlike the Restart tab below).
    - **Levels**: bars move when audio plays into an `RVAD *` device, and
      show the "no live data" state correctly if you stop the daemon.
-   - **Channel Mapping**: edit a value, confirm overlap highlighting works
-     by deliberately creating one, then fix it and try "Apply (restarts
-     daemon)" -- watch/listen through this restart too, same caution as
-     any daemon restart.
+   - **Channel Mapping**: try "Reset to Defaults", confirm it's a local
+     edit (no daemon restart) until you press Apply; edit a value to
+     create a deliberate overlap and confirm the red highlighting works,
+     then fix it and try "Apply (restarts daemon)" -- watch/listen through
+     this restart too, same caution as any daemon restart.
    - **Daemon**: Start/Stop buttons work, status + raw log tail both
      update.
-6. **Rollback if anything goes wrong:**
-   - Daemon/routing issues: `./daemon/uninstall-daemon.sh` stops audio
-     flow immediately (no sudo, no `coreaudiod` restart needed).
-   - Driver issues: `./uninstall.sh` (project root, needs `sudo`) removes
-     the driver and restarts `coreaudiod`, returning the system to its
-     prior state. If some app is misbehaving because it had an `RVAD *`
-     device selected when it was removed, just re-pick a real device in
-     that app's own audio settings.
-   - Channel-mapping issues specifically: edit `config/channel-map.conf`
-     by hand (or delete it to fall back to compiled-in defaults) and
-     restart the daemon -- no rebuild required, since the mapping is now
-     loaded at runtime.
+   - **Restart** (do this deliberately, volume down, not by accident --
+     this is the highest-blast-radius action in the app): confirm the
+     confirmation dialog appears, that cancelling it does nothing, and
+     that confirming shows the native admin-password prompt, restarts
+     `coreaudiod` (**all system audio briefly interrupts, not just this
+     project**), waits for devices, and restarts the daemon -- watch the
+     step-by-step status log in the tab.
+
+### B. Migrate to a proper installed setup (bigger, one-time transition)
+
+`./build/RodeCasterVirtualAudio-Installer.pkg` (built via `make installer`)
+is a **meaningful one-time transition**, not just another incremental
+tweak: running it moves your setup from *this dev checkout's*
+`build/rodevad-router` + project-relative `state/`/`config/`/`logs/`
+directories to `/Applications/VAD.app`'s embedded `rodevad-router` +
+`~/Library/Application Support/RodeCasterVirtualAudio/`. Both setups can
+coexist (they use different binary paths and different LaunchAgent plist
+contents, though the same LaunchAgent *label* -- installing via the .pkg
+will replace whichever LaunchAgent is currently registered under
+`com.abrendt.rodevad.router`), so be aware this is the point where you'd
+be swapping the currently-live dev-checkout daemon for the
+installed-app one, not layering a second one alongside it.
+
+1. Double-click `build/RodeCasterVirtualAudio-Installer.pkg` in Finder.
+   Since it's ad-hoc signed, macOS will likely show an "unidentified
+   developer" Gatekeeper warning first -- right-click > Open, or System
+   Settings > Privacy & Security > "Open Anyway" (see "Installer (.pkg) >
+   Signing" above).
+2. Read the Welcome pane, then proceed through Install (enter your admin
+   password when prompted -- this is the postinstall script's *one*
+   privileged operation, described in detail above).
+3. Check the Conclusion pane's next steps, then open **VAD** from
+   `/Applications`.
+4. On the Dashboard tab, confirm all 4 status rows are green, confirming
+   the new installed daemon (now running from
+   `/Applications/VAD.app/Contents/MacOS/rodevad-router`, writing to
+   `~/Library/Application Support/RodeCasterVirtualAudio/`) is healthy.
+5. Optionally enable "Launch VAD at Login" now that the app lives at a
+   stable path.
+
+### C. Rollback if anything goes wrong
+
+- Daemon/routing issues (dev-checkout setup): `./daemon/uninstall-daemon.sh`
+  stops audio flow immediately (no sudo, no `coreaudiod` restart needed).
+- Daemon/routing issues (`.pkg`-installed setup): the same
+  `daemon/uninstall-daemon.sh` command works here too if run with
+  `--router-bin /Applications/VAD.app/Contents/MacOS/rodevad-router`
+  matching what was installed -- or simply `launchctl bootout
+  gui/$(id -u) ~/Library/LaunchAgents/com.abrendt.rodevad.router.plist`
+  directly.
+- Driver issues: `./uninstall.sh` (project root, needs `sudo`) removes
+  the driver and restarts `coreaudiod`, returning the system to its
+  prior state. If some app is misbehaving because it had an `RVAD *`
+  device selected when it was removed, just re-pick a real device in
+  that app's own audio settings.
+- Channel-mapping issues specifically: edit `config/channel-map.conf`
+  (dev-checkout) or `~/Library/Application
+  Support/RodeCasterVirtualAudio/config/channel-map.conf`
+  (`.pkg`-installed) by hand -- or delete it to fall back to compiled-in
+  defaults -- and restart the daemon; no rebuild required, since the
+  mapping is loaded at runtime.
+- App install issues: just delete `/Applications/VAD.app` -- it's a
+  normal, self-contained app bundle, no special uninstaller needed for
+  the app itself (only the driver and the daemon's LaunchAgent need the
+  scripts above).

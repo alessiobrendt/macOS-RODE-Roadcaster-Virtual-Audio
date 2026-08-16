@@ -78,6 +78,24 @@ final class ChannelMapStore: ObservableObject {
         validate()
     }
 
+    /// Resets every entry's startChannel back to the compiled-in defaults
+    /// (system=1, game=3, music=5, virtuala=7, virtualb=9 -- matching
+    /// daemon/rodevad-router.c's sChannelMap initializer and
+    /// daemon/channel-map.example.conf). This is a LOCAL EDIT ONLY, exactly
+    /// like changing a single Stepper by hand: it does not touch
+    /// config/channel-map.conf on disk and does not restart the daemon by
+    /// itself. The existing hasUnsavedChanges/validationError flow is
+    /// reused (via recomputeUnsavedChanges()/validate()) so "Apply
+    /// (restarts daemon)" is still required afterward to actually save and
+    /// restart with the reset values.
+    func resetToDefaults() {
+        for idx in entries.indices {
+            entries[idx].startChannel = Self.defaultStartChannels[entries[idx].key] ?? entries[idx].startChannel
+        }
+        recomputeUnsavedChanges()
+        validate()
+    }
+
     private func recomputeUnsavedChanges() {
         let current = Dictionary(uniqueKeysWithValues: entries.map { ($0.key, $0.startChannel) })
         hasUnsavedChanges = current != savedSnapshot

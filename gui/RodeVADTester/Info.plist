@@ -5,15 +5,17 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleExecutable</key>
-	<string>RodeVADTester</string>
+	<string>VAD</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.abrendt.rodecastervad.gui</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>RodeVADTester</string>
+	<string>VAD</string>
 	<key>CFBundleDisplayName</key>
-	<string>RodeCaster VAD Tester</string>
+	<string>VAD — Virtual Audio Driver</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleSignature</key>

@@ -20,13 +20,39 @@
 #   ./daemon/install-daemon.sh
 #
 # What it does:
-#   1. Builds rodevad-router if it hasn't been built yet.
-#   2. Creates a logs/ directory inside this project for its stdout/stderr.
-#   3. Fills in this project's actual absolute paths into the
+#   1. Builds rodevad-router if it hasn't been built yet (default mode
+#      only -- skipped if --router-bin points somewhere else, see below).
+#   2. Creates a logs/ (+ state/, config/) directory for its stdout/stderr
+#      (and runtime data) under the working directory.
+#   3. Fills in the actual absolute paths into the
 #      com.abrendt.rodevad.router.plist template and copies the result to
 #      ~/Library/LaunchAgents/com.abrendt.rodevad.router.plist.
 #   4. Runs `launchctl load` to start it now and register it to start
 #      automatically at every future login.
+#
+# Optional arguments (both default to today's exact original behavior when
+# omitted, so this remains 100% backward compatible with the plain
+# `./install-daemon.sh` no-args invocation the currently-live daemon setup
+# uses):
+#
+#   --router-bin <path>    Path to the rodevad-router binary to run.
+#                           Default: <project>/build/rodevad-router
+#                           (the dev-checkout build). When installed via
+#                           the .pkg installer (see ../Makefile's
+#                           `installer` target), the postinstall script
+#                           uses its own self-contained equivalent of this
+#                           logic instead (it runs as root and must target
+#                           the console user specifically, a scenario this
+#                           plain per-user script isn't designed for) --
+#                           but --router-bin/--working-dir remain here as
+#                           a general, scriptable capability, e.g. for
+#                           manually pointing this script at an
+#                           already-installed /Applications/VAD.app
+#                           without going through the .pkg.
+#   --working-dir <path>   Directory the daemon's relative state/config/
+#                           logs paths resolve against (also becomes the
+#                           LaunchAgent's WorkingDirectory).
+#                           Default: <project> (this checkout's root).
 #
 # The daemon itself waits (up to ~5 minutes per launch, then lets launchd
 # relaunch it) for the 5 RVAD virtual devices and the RodeCaster's
@@ -40,15 +66,39 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_DIR"
 
 ROUTER_BIN="$PROJECT_DIR/build/rodevad-router"
+WORKING_DIR="$PROJECT_DIR"
+ROUTER_BIN_OVERRIDDEN=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --router-bin)
+            ROUTER_BIN="$2"
+            ROUTER_BIN_OVERRIDDEN=1
+            shift 2
+            ;;
+        --working-dir)
+            WORKING_DIR="$2"
+            shift 2
+            ;;
+        *)
+            echo "error: unrecognized argument: $1" >&2
+            echo "usage: $0 [--router-bin <path>] [--working-dir <path>]" >&2
+            exit 2
+            ;;
+    esac
+done
+
 TEMPLATE_PLIST="$SCRIPT_DIR/com.abrendt.rodevad.router.plist"
 LABEL="com.abrendt.rodevad.router"
 DEST_PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
-LOG_DIR="$PROJECT_DIR/logs"
+LOG_DIR="$WORKING_DIR/logs"
 STDOUT_LOG="$LOG_DIR/rodevad-router.out.log"
 STDERR_LOG="$LOG_DIR/rodevad-router.err.log"
 
 echo "==> rodevad-router LaunchAgent installer"
 echo "==> This installs a PER-USER agent -- no sudo required."
+echo "==> Router binary: $ROUTER_BIN"
+echo "==> Working directory (state/config/logs): $WORKING_DIR"
 echo ""
 echo "!! SAFETY NOTE: the first time you run this with the RodeCaster Pro 2"
 echo "!! actually connected, turn your system volume DOWN first. This is the"
@@ -57,22 +107,27 @@ echo "!! watch/listen for pops, glitches, or feedback loops before trusting it."
 echo "!! See README \"Routing daemon\" for the full pre-flight checklist."
 echo ""
 
-if [ ! -x "$ROUTER_BIN" ]; then
+if [ -z "$ROUTER_BIN_OVERRIDDEN" ] && [ ! -x "$ROUTER_BIN" ]; then
     echo "==> $ROUTER_BIN not found, building it now..."
     make daemon
+fi
+
+if [ ! -x "$ROUTER_BIN" ]; then
+    echo "error: router binary not found or not executable at $ROUTER_BIN" >&2
+    exit 1
 fi
 
 echo "==> Running offline self-test one more time before installing..."
 "$ROUTER_BIN" --selftest
 
-mkdir -p "$LOG_DIR" "$PROJECT_DIR/state" "$PROJECT_DIR/config"
+mkdir -p "$LOG_DIR" "$WORKING_DIR/state" "$WORKING_DIR/config"
 
 echo "==> Writing $DEST_PLIST"
 mkdir -p "$HOME/Library/LaunchAgents"
 sed -e "s#__ROUTER_BIN_PATH__#${ROUTER_BIN}#g" \
     -e "s#__STDOUT_LOG__#${STDOUT_LOG}#g" \
     -e "s#__STDERR_LOG__#${STDERR_LOG}#g" \
-    -e "s#__WORKING_DIR__#${PROJECT_DIR}#g" \
+    -e "s#__WORKING_DIR__#${WORKING_DIR}#g" \
     "$TEMPLATE_PLIST" > "$DEST_PLIST"
 
 plutil -lint "$DEST_PLIST"

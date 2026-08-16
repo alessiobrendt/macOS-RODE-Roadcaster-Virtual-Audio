@@ -1,0 +1,26 @@
+<html>
+<body style="font-family: -apple-system, sans-serif; font-size: 13px;">
+<h2>Installed</h2>
+<p>Next steps:</p>
+<ol>
+  <li>Open <b>VAD</b> from <tt>/Applications</tt> (Launchpad, Spotlight,
+      or Finder).</li>
+  <li>Check the <b>Dashboard</b> tab: it should show the HAL driver
+      installed, the RodeCaster Multitrack device connected (if plugged
+      in over USB), all 5 RVAD virtual devices visible, and the router
+      daemon running.</li>
+  <li>Optionally enable <b>"Launch VAD at Login"</b> on the Dashboard tab
+      if you want the app itself to open automatically -- the background
+      routing daemon already starts on its own via its LaunchAgent
+      regardless of this toggle.</li>
+  <li>Use the <b>Channel Test</b> tab to confirm each virtual channel
+      carries audio, and the <b>Channel Mapping</b> tab if audio needs to
+      be routed to different RodeCaster hardware channels than the
+      defaults.</li>
+</ol>
+<p>To remove everything this installer set up, see the project README's
+uninstall instructions (<tt>uninstall.sh</tt> for the driver,
+<tt>daemon/uninstall-daemon.sh</tt> for the routing daemon, and manually
+removing <tt>/Applications/VAD.app</tt>).</p>
+</body>
+</html>

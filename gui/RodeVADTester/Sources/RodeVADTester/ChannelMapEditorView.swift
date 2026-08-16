@@ -34,6 +34,15 @@ struct ChannelMapEditorView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer()
+
+                Button {
+                    channelMapStore.resetToDefaults()
+                } label: {
+                    Label("Reset to Defaults", systemImage: "arrow.counterclockwise")
+                }
+                .disabled(isBusyElsewhere)
+                .help("Resets the steppers below to the compiled-in defaults (1/3/5/7/9). Local edit only -- press Apply afterward to actually save and restart with these values.")
+
                 Button {
                     Task { await channelMapStore.applyAndRestart(daemonController: daemonController) }
                 } label: {
@@ -53,8 +62,12 @@ struct ChannelMapEditorView: View {
         .onAppear { channelMapStore.load() }
     }
 
+    private var isBusyElsewhere: Bool {
+        daemonController.isBusy || channelMapStore.isBusy
+    }
+
     private var isApplyDisabled: Bool {
-        daemonController.isBusy || channelMapStore.isBusy || channelMapStore.validationError != nil || !channelMapStore.hasUnsavedChanges
+        isBusyElsewhere || channelMapStore.validationError != nil || !channelMapStore.hasUnsavedChanges
     }
 
     private var header: some View {

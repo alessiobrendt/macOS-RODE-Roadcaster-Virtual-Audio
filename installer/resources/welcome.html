@@ -1,0 +1,27 @@
+<html>
+<body style="font-family: -apple-system, sans-serif; font-size: 13px;">
+<h2>RodeCaster Virtual Audio Driver (VAD)</h2>
+<p>This installs a self-built, independent replacement for RØDE's broken
+official virtual audio driver for the RodeCaster Pro 2.</p>
+<p>This installer sets up three things:</p>
+<ul>
+  <li><b>The HAL audio driver</b> (<tt>RodeCasterVirtualAudio.driver</tt>)
+      into <tt>/Library/Audio/Plug-Ins/HAL/</tt>, exposing 5 virtual
+      devices (RVAD System / Game / Music / Virtual A / Virtual B) that
+      macOS apps can select as audio input/output.</li>
+  <li><b>The VAD app</b> into <tt>/Applications</tt> -- the control
+      surface for everything: a dashboard, per-channel test tones, live
+      level meters, channel-mapping editor, and daemon controls.</li>
+  <li><b>The background routing daemon</b> (<tt>rodevad-router</tt>) as a
+      per-user LaunchAgent for the account you're currently logged in as
+      -- it bridges the 5 virtual devices into the RodeCaster Pro 2's real
+      10-channel "Main Multitrack" hardware interface.</li>
+</ul>
+<p>This will restart <tt>coreaudiod</tt> (macOS's core audio process) as
+part of installation, which briefly interrupts all system audio for a
+moment -- close anything currently playing audio before continuing.</p>
+<p>This package is ad-hoc signed (no paid Apple Developer ID), so macOS
+Gatekeeper may show an "unidentified developer" warning before you can
+run it -- see the project README for how to proceed past that.</p>
+</body>
+</html>

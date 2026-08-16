@@ -95,31 +95,88 @@ enum ProjectLayout {
 
     // MARK: - Binaries
 
-    static func testtoneBinary() throws -> URL { try buildDirectory().appendingPathComponent("testtone") }
-    static func routerBinary() throws -> URL { try buildDirectory().appendingPathComponent("rodevad-router") }
+    /// Resolution order: (1) embedded inside this running app bundle's
+    /// own Contents/MacOS/ (the self-contained, /Applications-installable
+    /// case -- see the Makefile's `gui` target, which copies testtone and
+    /// rodevad-router in there), (2) the sibling-of-bundle build/<name>
+    /// location (the original dev-checkout layout), (3) the dev-mode
+    /// CWD-walk fallback already built into projectRoot(). Cases 2 and 3
+    /// are really the same code path (buildDirectory() is derived from
+    /// projectRoot(), which already does the CWD-walk) -- only case 1 is
+    /// new; everything below it is exactly the pre-existing behavior, so
+    /// this is fully backward compatible with the original dev workflow.
+    private static func embeddedBinary(named name: String) -> URL? {
+        let bundleURL = Bundle.main.bundleURL
+        guard bundleURL.pathExtension == "app" else { return nil }
+        let candidate = bundleURL.appendingPathComponent("Contents/MacOS").appendingPathComponent(name)
+        return FileManager.default.isExecutableFile(atPath: candidate.path) ? candidate : nil
+    }
+
+    static func testtoneBinary() throws -> URL {
+        if let embedded = embeddedBinary(named: "testtone") { return embedded }
+        return try buildDirectory().appendingPathComponent("testtone")
+    }
+
+    static func routerBinary() throws -> URL {
+        if let embedded = embeddedBinary(named: "rodevad-router") { return embedded }
+        return try buildDirectory().appendingPathComponent("rodevad-router")
+    }
 
     // MARK: - Daemon scripts (per-user, no sudo -- see daemon/install-daemon.sh)
 
     static func installDaemonScript() throws -> URL { try daemonDirectory().appendingPathComponent("install-daemon.sh") }
     static func uninstallDaemonScript() throws -> URL { try daemonDirectory().appendingPathComponent("uninstall-daemon.sh") }
 
+    // MARK: - Runtime data directories (state / config / logs)
+
+    /// The stable per-user runtime data location a properly
+    /// `install-all.sh`-installed setup uses instead of a dev checkout's
+    /// project-relative directories: `~/Library/Application
+    /// Support/RodeCasterVirtualAudio/`. This mirrors exactly what
+    /// install-all.sh passes to install-daemon.sh's `--working-dir` flag.
+    private static var applicationSupportDirectory: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
+        return base.appendingPathComponent("RodeCasterVirtualAudio")
+    }
+
+    /// Resolves one of the 3 runtime data subdirectories (state/config/
+    /// logs). Prefers `~/Library/Application Support/RodeCasterVirtualAudio/<name>`
+    /// if it already exists on disk -- meaning install-all.sh has set up
+    /// a properly installed daemon that writes there -- falling back to
+    /// the project-relative `<projectRoot>/<name>` directory otherwise
+    /// (the original, still-fully-supported dev-checkout layout the
+    /// currently-live daemon setup uses unchanged). This is a pure
+    /// existence check, not a hardcoded "are we installed" flag, so it
+    /// adapts automatically to whichever setup is actually present.
+    private static func runtimeDataDirectory(named name: String) throws -> URL {
+        let appSupportCandidate = applicationSupportDirectory.appendingPathComponent(name)
+        if FileManager.default.fileExists(atPath: appSupportCandidate.path) {
+            return appSupportCandidate
+        }
+        return try projectRoot().appendingPathComponent(name)
+    }
+
     // MARK: - Config / state files
 
     /// The live, user-editable channel-map override. May not exist yet --
     /// callers should fall back to channelMapExampleConfig() as a
     /// starting template (see ChannelMapStore.load()).
-    static func channelMapConfig() throws -> URL { try configDirectory().appendingPathComponent("channel-map.conf") }
+    static func channelMapConfig() throws -> URL { try runtimeDataDirectory(named: "config").appendingPathComponent("channel-map.conf") }
 
     /// The tracked, documented template/example (daemon/channel-map.example.conf).
+    /// Always project-relative -- this is a source file, not runtime
+    /// data, and only exists in a dev checkout, never inside an installed
+    /// app bundle or Application Support.
     static func channelMapExampleConfig() throws -> URL { try daemonDirectory().appendingPathComponent("channel-map.example.conf") }
 
     /// The daemon's live level-meter snapshot file, rewritten atomically
     /// roughly every 75ms while the daemon is running (see
     /// daemon/rodevad-router.c's LevelsWriterThreadMain).
-    static func levelsFile() throws -> URL { try stateDirectory().appendingPathComponent("rodevad-router.levels") }
+    static func levelsFile() throws -> URL { try runtimeDataDirectory(named: "state").appendingPathComponent("rodevad-router.levels") }
 
     // MARK: - Logs
 
-    static func stdoutLog() throws -> URL { try logsDirectory().appendingPathComponent("rodevad-router.out.log") }
-    static func stderrLog() throws -> URL { try logsDirectory().appendingPathComponent("rodevad-router.err.log") }
+    static func stdoutLog() throws -> URL { try runtimeDataDirectory(named: "logs").appendingPathComponent("rodevad-router.out.log") }
+    static func stderrLog() throws -> URL { try runtimeDataDirectory(named: "logs").appendingPathComponent("rodevad-router.err.log") }
 }
