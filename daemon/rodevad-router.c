@@ -1101,6 +1101,85 @@ static int RunSelfTest(void)
         }
     }
 
+    // --- Test 9: combined push -> pop -> level-compute -> hardware-write pipeline, exercised TOGETHER ---
+    // Tests 1-7 above each exercise one stage of HardwareIOProc's real
+    // per-device loop in isolation (ring buffer alone, WriteStereoIntoBufferList
+    // alone, ComputeLevelUpdate alone). This test instead pushes one block
+    // of known audio through all four stages in the same order and using
+    // the same intermediate buffer HardwareIOProc actually uses
+    // (RingBufferPush -> RingBufferPop into a scratch buffer -> that same
+    // scratch buffer feeds BOTH ComputeLevelUpdate AND
+    // WriteStereoIntoBufferList), so a bug where one stage doesn't see
+    // what the previous stage actually produced -- the class of bug a
+    // live investigation in this project once suspected but could not
+    // confirm via code alone -- would show up here even without real
+    // device IO. This does NOT catch OS-level failures (e.g. a privacy
+    // permission silently zeroing real captured audio) -- those are only
+    // observable live, by design nothing in --selftest touches a real
+    // device.
+    {
+        static RingBuffer ring;
+        memset(&ring, 0, sizeof(ring));
+
+        UInt32 frameCount = 6;
+        Float32 pushed[6 * 2];
+        for (UInt32 f = 0; f < frameCount; ++f)
+        {
+            pushed[f * 2 + 0] = 0.5f;  // constant amplitude -- easy to check exact peak/RMS/written values
+            pushed[f * 2 + 1] = -0.5f;
+        }
+        RingBufferPush(&ring, pushed, frameCount);
+
+        Float32 scratch[6 * 2];
+        memset(scratch, 0, sizeof(scratch));
+        UInt32 popped = RingBufferPop(&ring, scratch, frameCount);
+
+        Float32 peakL, peakR, rmsL, rmsR;
+        ComputeLevelUpdate(0.0f, 0.0f, scratch, frameCount, &peakL, &peakR, &rmsL, &rmsR);
+
+        Float32 dest[6 * kMultitrackChannelCount];
+        memset(dest, 0, sizeof(dest));
+        AudioBuffer buf;
+        buf.mNumberChannels = kMultitrackChannelCount;
+        buf.mDataByteSize = sizeof(dest);
+        buf.mData = dest;
+        AudioBufferList list;
+        list.mNumberBuffers = 1;
+        list.mBuffers[0] = buf;
+
+        int deviceIdx = 3; // "RVAD Virtual A" -- the device from the live bug report this test was added for
+        Boolean wrote = WriteStereoIntoBufferList(&list, kDefaultChannelMap[deviceIdx].firstChannel, scratch, frameCount);
+
+        Boolean pipelineOK = (popped == frameCount)
+            && (peakL == 0.5f && peakR == 0.5f)
+            && (fabsf(rmsL - 0.5f) < 0.0001f && fabsf(rmsR - 0.5f) < 0.0001f)
+            && wrote;
+
+        if (pipelineOK)
+        {
+            for (UInt32 f = 0; f < frameCount; ++f)
+            {
+                Float32 gotL = dest[f * kMultitrackChannelCount + kDefaultChannelMap[deviceIdx].firstChannel + 0];
+                Float32 gotR = dest[f * kMultitrackChannelCount + kDefaultChannelMap[deviceIdx].firstChannel + 1];
+                if (gotL != 0.5f || gotR != -0.5f) pipelineOK = false;
+            }
+        }
+
+        if (!pipelineOK)
+        {
+            fprintf(stderr, "SELFTEST FAIL: combined push->pop->level-compute->hardware-write pipeline inconsistent "
+                            "(popped=%u peakL=%f peakR=%f rmsL=%f rmsR=%f wrote=%d)\n",
+                    popped, peakL, peakR, rmsL, rmsR, wrote);
+            failures++;
+        }
+        else
+        {
+            printf("SELFTEST OK: combined ring-buffer + level-metering + hardware-write pipeline is internally "
+                   "consistent (the same popped scratch buffer drives correct levels AND correct hardware-buffer "
+                   "content, matching HardwareIOProc's real per-device loop end to end)\n");
+        }
+    }
+
     if (failures == 0)
     {
         printf("SELFTEST: ALL CHECKS PASSED\n");
@@ -1338,6 +1417,13 @@ int main(int argc, char **argv)
                     kVirtualDeviceIdentities[i].name, (int)status);
             return 1;
         }
+        // Previously this loop only logged failures, never successes --
+        // meaning a healthy-looking startup gave no direct evidence that
+        // IOProc capture was actually registered for each of the 5
+        // devices individually. Log each success explicitly so a log
+        // (not just "no ERROR line") is positive proof of registration
+        // for this specific device, one line per device, always printed.
+        printf("rodevad-router: capture IOProc registered and started for \"%s\"\n", kVirtualDeviceIdentities[i].name);
     }
 
     static HardwareIOContext sHWContext;
@@ -1361,6 +1447,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "rodevad-router: ERROR - AudioDeviceStart failed for the Multitrack device (status %d)\n", (int)status);
         return 1;
     }
+    printf("rodevad-router: hardware IOProc registered and started for the Multitrack device\n");
 
     printf("rodevad-router: running. Channel mapping:\n");
     for (int i = 0; i < kNumberOfVirtualDevices; ++i)
@@ -1368,6 +1455,25 @@ int main(int argc, char **argv)
         printf("  %-15s -> Multitrack channels %d-%d\n", kVirtualDeviceIdentities[i].name,
                sChannelMap[i].firstChannel + 1, sChannelMap[i].firstChannel + 2);
     }
+
+    // Always-printed (not a heuristic-triggered warning -- avoiding a
+    // time-since-startup-based nag that would false-positive on every
+    // completely normal "nobody's played anything into a device yet"
+    // startup) reminder about a real, previously-hit failure mode: macOS
+    // privacy controls for capturing audio (Microphone, and separately
+    // "Screen & System Audio Recording" for capturing OTHER apps'/system
+    // audio via a virtual device the way this daemon's VirtualDeviceIOProc
+    // does) can silently deliver empty/muted data to a capture callback
+    // instead of an explicit CoreAudio error when permission hasn't been
+    // granted for THIS SPECIFIC binary/bundle identity -- which looks
+    // indistinguishable from "everything is healthy but no audio ever
+    // arrives" (a healthy startup, no ERROR lines, an actively-running
+    // IOProc, yet state/rodevad-router.levels stays at exactly 0.000).
+    // This is NOT something this daemon can detect or fix in code -- it
+    // requires the user to grant permission in System Settings.
+    printf("rodevad-router: NOTE - if a device's level meter stays at 0 even while you're confident audio is\n");
+    printf("rodevad-router: NOTE - playing into it, check System Settings > Privacy & Security > Microphone and\n");
+    printf("rodevad-router: NOTE - > Screen & System Audio Recording, and make sure this app is allowed there.\n");
 
     // Start the levels-writer thread only now that every IOProc is
     // actually running (so sLevels has real data to write instead of
