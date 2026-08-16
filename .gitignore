@@ -4,3 +4,4 @@ build/
 .DS_Store
 gui/RodeVADTester/.build/
 gui/RodeVADTester/.swiftpm/
+logs/

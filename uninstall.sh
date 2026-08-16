@@ -42,9 +42,13 @@ sudo killall coreaudiod || true
 echo "==> Waiting for coreaudiod to come back up..."
 sleep 2
 
-echo "==> Done. \"RodeCaster Virtual Audio\" should no longer appear in"
-echo "    system_profiler SPAudioDataType or Audio MIDI Setup.app."
+echo "==> Done. The 5 \"RVAD *\" devices (System, Game, Music, Virtual A, Virtual B)"
+echo "    should no longer appear in system_profiler SPAudioDataType or Audio MIDI Setup.app."
 echo ""
-echo "==> If any app still shows it selected as an input/output device,"
+echo "==> If any app still shows one selected as an input/output device,"
 echo "    re-select a real device in that app's audio settings -- removing"
 echo "    the driver does not automatically re-point apps that had it chosen."
+echo ""
+echo "==> Note: this only removes the HAL driver. If daemon/install-daemon.sh"
+echo "    was also used to install the routing daemon, run"
+echo "    ./daemon/uninstall-daemon.sh separately to stop and remove that too."

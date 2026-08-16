@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	Per-user LaunchAgent template for rodevad-router.
+
+	This is a TEMPLATE: the __ROUTER_BIN_PATH__, __STDOUT_LOG__, and
+	__STDERR_LOG__ placeholders below are filled in by
+	daemon/install-daemon.sh with this project's actual absolute path
+	before the resolved plist is copied to
+	~/Library/LaunchAgents/com.abrendt.rodevad.router.plist. Do not edit
+	the placeholders in THIS file's copy of the tracked template -- edit
+	install-daemon.sh's sed substitutions instead, or hand-edit the
+	installed copy under ~/Library/LaunchAgents/ directly.
+
+	This is a per-user LaunchAgent (loaded into the user's own login
+	session with `launchctl load`), NOT a system-wide LaunchDaemon --
+	installing it never requires sudo, unlike the HAL driver bundle.
+	-->
+	<key>Label</key>
+	<string>com.abrendt.rodevad.router</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>__ROUTER_BIN_PATH__</string>
+	</array>
+
+	<!-- Start it automatically at login/on load... -->
+	<key>RunAtLoad</key>
+	<true/>
+
+	<!-- ...and have launchd relaunch it if it exits non-zero (e.g. our
+	     own device-wait timeout, or a transient CoreAudio error), but NOT
+	     if it exits 0 (a deliberate, clean stop via SIGTERM/SIGINT from
+	     `launchctl unload` or Ctrl-C). launchd's own default throttling
+	     (minimum ~10s between relaunches) keeps this from turning into a
+	     restart storm if something is persistently wrong. -->
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+
+	<key>StandardOutPath</key>
+	<string>__STDOUT_LOG__</string>
+
+	<key>StandardErrorPath</key>
+	<string>__STDERR_LOG__</string>
+
+	<key>ProcessType</key>
+	<string>Interactive</string>
+</dict>
+</plist>

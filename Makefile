@@ -18,6 +18,9 @@ VERSION_PLIST_SRC := Resources/version.plist
 TESTTONE_SRC   := tools/testtone.c
 TESTTONE_BIN   := $(BUILD_DIR)/testtone
 
+DAEMON_SRC      := daemon/rodevad-router.c
+DAEMON_BIN      := $(BUILD_DIR)/rodevad-router
+
 GUI_DIR         := gui/RodeVADTester
 GUI_PRODUCT     := RodeVADTester
 GUI_APP         := $(BUILD_DIR)/$(GUI_PRODUCT).app
@@ -40,7 +43,7 @@ TOOL_CFLAGS    := -arch $(ARCH) -isysroot $(SDK) -mmacosx-version-min=12.0 \
 
 FRAMEWORKS     := -framework CoreFoundation -framework CoreAudio -framework AudioToolbox
 
-.PHONY: all clean sign verify install-info testtone gui gui-verify
+.PHONY: all clean sign verify install-info testtone gui gui-verify daemon daemon-verify daemon-selftest
 
 all: $(BUNDLE) verify testtone
 
@@ -49,6 +52,29 @@ testtone: $(TESTTONE_BIN)
 $(TESTTONE_BIN): $(TESTTONE_SRC)
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(TOOL_CFLAGS) -o $(TESTTONE_BIN) $(TESTTONE_SRC) $(FRAMEWORKS)
+
+# Builds the standalone routing daemon (daemon/rodevad-router.c). This is
+# an ordinary command-line binary, NOT part of the HAL plug-in bundle --
+# it is meant to run as a per-user LaunchAgent, bridging the 5 virtual
+# devices into the real RodeCaster Pro 2 hardware. See README "Routing
+# daemon" for what it does and the manual steps to install/run it.
+daemon: $(DAEMON_BIN)
+	$(MAKE) daemon-verify
+
+$(DAEMON_BIN): $(DAEMON_SRC)
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(TOOL_CFLAGS) -o $(DAEMON_BIN) $(DAEMON_SRC) $(FRAMEWORKS)
+
+daemon-verify: $(DAEMON_BIN)
+	@echo "--- codesign (ad-hoc) rodevad-router ---"
+	codesign --force --sign - $(DAEMON_BIN)
+	codesign -dv $(DAEMON_BIN)
+	@echo "--- offline self-test (pure buffer math, no device IO) ---"
+	$(DAEMON_BIN) --selftest
+
+# Convenience alias: just the offline self-test, no (re)build forced.
+daemon-selftest: $(DAEMON_BIN)
+	$(DAEMON_BIN) --selftest
 
 # Builds the SwiftUI channel-tester GUI app via `swift build` (no Xcode
 # required -- Swift Package Manager + the Command Line Tools are

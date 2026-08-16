@@ -67,8 +67,9 @@ echo "==> Waiting for coreaudiod to come back up..."
 sleep 2
 
 echo "==> Done. Verify with:"
-echo "      system_profiler SPAudioDataType | grep -A5 'RodeCaster Virtual Audio'"
-echo "    or open Audio MIDI Setup.app and look for \"RodeCaster Virtual Audio\"."
+echo "      system_profiler SPAudioDataType | grep -A5 'RVAD'"
+echo "    or open Audio MIDI Setup.app and look for all 5 of \"RVAD System\", \"RVAD Game\","
+echo "    \"RVAD Music\", \"RVAD Virtual A\", and \"RVAD Virtual B\"."
 echo ""
 echo "==> If the device does NOT appear:"
 echo "    - Re-check System Settings > Privacy & Security. Newer macOS versions"

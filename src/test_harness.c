@@ -118,37 +118,94 @@ int main(int argc, char **argv)
     }
     printf("OK: Initialize succeeded\n");
 
-    AudioObjectPropertyAddress theAddr = { kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
-    Boolean theHas = theInterface->HasProperty(theDriver, 3 /* kObjectID_Device */, 0, &theAddr);
-    printf("%s: device HasProperty(Name) = %d\n", theHas ? "OK" : "FAIL", theHas);
-    if (!theHas) return 1;
-
-    UInt32 theDataSize = 0;
-    theStatus = theInterface->GetPropertyDataSize(theDriver, 3, 0, &theAddr, 0, NULL, &theDataSize);
-    if (theStatus != 0 || theDataSize != sizeof(CFStringRef))
+    // Discover the device list dynamically via the plug-in object's
+    // kAudioPlugInPropertyDeviceList, exactly like a real host would --
+    // this way the test doesn't hardcode object IDs and stays correct
+    // regardless of how many virtual devices the driver exposes or how
+    // its object-ID numbering scheme is laid out internally.
+    const AudioObjectID kPlugInObjectID = 1;
+    AudioObjectPropertyAddress theDeviceListAddr = { kAudioPlugInPropertyDeviceList, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    UInt32 theListSize = 0;
+    theStatus = theInterface->GetPropertyDataSize(theDriver, kPlugInObjectID, 0, &theDeviceListAddr, 0, NULL, &theListSize);
+    if (theStatus != 0 || theListSize == 0)
     {
-        fprintf(stderr, "FAIL: GetPropertyDataSize(Name) status=%d size=%u\n", (int)theStatus, theDataSize);
+        fprintf(stderr, "FAIL: GetPropertyDataSize(DeviceList) status=%d size=%u\n", (int)theStatus, theListSize);
         return 1;
     }
-
-    CFStringRef theName = NULL;
+    UInt32 theDeviceCount = theListSize / sizeof(AudioObjectID);
+    AudioObjectID theDeviceIDs[64];
+    if (theDeviceCount > 64) { fprintf(stderr, "FAIL: unexpectedly large device count %u\n", theDeviceCount); return 1; }
     UInt32 theWritten = 0;
-    theStatus = theInterface->GetPropertyData(theDriver, 3, 0, &theAddr, 0, NULL, sizeof(theName), &theWritten, &theName);
-    if (theStatus != 0 || theName == NULL)
+    theStatus = theInterface->GetPropertyData(theDriver, kPlugInObjectID, 0, &theDeviceListAddr, 0, NULL, theListSize, &theWritten, theDeviceIDs);
+    if (theStatus != 0)
     {
-        fprintf(stderr, "FAIL: GetPropertyData(Name) status=%d\n", (int)theStatus);
+        fprintf(stderr, "FAIL: GetPropertyData(DeviceList) status=%d\n", (int)theStatus);
         return 1;
     }
-    char theNameBuf[256];
-    CFStringGetCString(theName, theNameBuf, sizeof(theNameBuf), kCFStringEncodingUTF8);
-    printf("OK: device name = \"%s\"\n", theNameBuf);
+    printf("OK: plug-in reports %u device(s)\n", theDeviceCount);
+    if (theDeviceCount != 5)
+    {
+        fprintf(stderr, "FAIL: expected 5 virtual devices, found %u\n", theDeviceCount);
+        return 1;
+    }
 
-    // Sanity-check the stream count and format on the output stream.
+    AudioObjectPropertyAddress theNameAddr = { kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    AudioObjectPropertyAddress theUIDAddr = { kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    AudioObjectPropertyAddress theOwnedAddr = { kAudioObjectPropertyOwnedObjects, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+
+    char theNames[5][256];
+    char theUIDs[5][256];
+    AudioObjectID theOutputStreamIDs[5];
+    AudioObjectID theInputStreamIDs[5];
+
+    for (UInt32 d = 0; d < theDeviceCount; ++d)
+    {
+        AudioObjectID theDeviceID = theDeviceIDs[d];
+
+        Boolean theHas = theInterface->HasProperty(theDriver, theDeviceID, 0, &theNameAddr);
+        if (!theHas) { fprintf(stderr, "FAIL: device %u HasProperty(Name) = false\n", theDeviceID); return 1; }
+
+        CFStringRef theName = NULL;
+        theWritten = 0;
+        theStatus = theInterface->GetPropertyData(theDriver, theDeviceID, 0, &theNameAddr, 0, NULL, sizeof(theName), &theWritten, &theName);
+        if (theStatus != 0 || theName == NULL) { fprintf(stderr, "FAIL: GetPropertyData(Name) on device %u status=%d\n", theDeviceID, (int)theStatus); return 1; }
+        CFStringGetCString(theName, theNames[d], sizeof(theNames[d]), kCFStringEncodingUTF8);
+
+        CFStringRef theUID = NULL;
+        theWritten = 0;
+        theStatus = theInterface->GetPropertyData(theDriver, theDeviceID, 0, &theUIDAddr, 0, NULL, sizeof(theUID), &theWritten, &theUID);
+        if (theStatus != 0 || theUID == NULL) { fprintf(stderr, "FAIL: GetPropertyData(DeviceUID) on device %u status=%d\n", theDeviceID, (int)theStatus); return 1; }
+        CFStringGetCString(theUID, theUIDs[d], sizeof(theUIDs[d]), kCFStringEncodingUTF8);
+
+        // Discover this device's input/output stream object IDs via its
+        // OwnedObjects property rather than assuming a numbering scheme.
+        AudioObjectID theOwned[8];
+        theWritten = 0;
+        theStatus = theInterface->GetPropertyData(theDriver, theDeviceID, 0, &theOwnedAddr, 0, NULL, sizeof(theOwned), &theWritten, theOwned);
+        if (theStatus != 0 || theWritten != 2 * sizeof(AudioObjectID)) { fprintf(stderr, "FAIL: GetPropertyData(OwnedObjects) on device %u status=%d size=%u\n", theDeviceID, (int)theStatus, theWritten); return 1; }
+        theInputStreamIDs[d] = theOwned[0];
+        theOutputStreamIDs[d] = theOwned[1];
+
+        printf("OK: device %2u  id=%-3u  name=\"%-14s\"  uid=%s\n", d, theDeviceID, theNames[d], theUIDs[d]);
+    }
+
+    // Confirm all 5 names and all 5 UIDs are pairwise distinct.
+    for (UInt32 a = 0; a < theDeviceCount; ++a)
+    {
+        for (UInt32 b = a + 1; b < theDeviceCount; ++b)
+        {
+            if (strcmp(theNames[a], theNames[b]) == 0) { fprintf(stderr, "FAIL: devices %u and %u have the same name \"%s\"\n", a, b, theNames[a]); return 1; }
+            if (strcmp(theUIDs[a], theUIDs[b]) == 0) { fprintf(stderr, "FAIL: devices %u and %u have the same UID \"%s\"\n", a, b, theUIDs[a]); return 1; }
+        }
+    }
+    printf("OK: all %u device names and UIDs are pairwise distinct\n", theDeviceCount);
+
+    // Sanity-check the stream format on the first device's output stream.
     AudioObjectPropertyAddress theFmtAddr = { kAudioStreamPropertyVirtualFormat, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
     AudioStreamBasicDescription theASBD;
     memset(&theASBD, 0, sizeof(theASBD));
     theWritten = 0;
-    theStatus = theInterface->GetPropertyData(theDriver, 5 /* kObjectID_Stream_Output */, 0, &theFmtAddr, 0, NULL, sizeof(theASBD), &theWritten, &theASBD);
+    theStatus = theInterface->GetPropertyData(theDriver, theOutputStreamIDs[0], 0, &theFmtAddr, 0, NULL, sizeof(theASBD), &theWritten, &theASBD);
     if (theStatus != 0)
     {
         fprintf(stderr, "FAIL: GetPropertyData(VirtualFormat) status=%d\n", (int)theStatus);
@@ -158,41 +215,72 @@ int main(int argc, char **argv)
            theASBD.mSampleRate, theASBD.mChannelsPerFrame, theASBD.mBitsPerChannel);
 
     // Exercise a StartIO/DoIOOperation write + read round trip through
-    // the ring buffer to prove the "virtual cable" behavior end to end.
-    theStatus = theInterface->StartIO(theDriver, 3, 1);
-    if (theStatus != 0) { fprintf(stderr, "FAIL: StartIO status=%d\n", (int)theStatus); return 1; }
-
-    Float64 theSampleTime = 0; UInt64 theHostTime = 0; UInt64 theSeed = 0;
-    theStatus = theInterface->GetZeroTimeStamp(theDriver, 3, 1, &theSampleTime, &theHostTime, &theSeed);
-    if (theStatus != 0) { fprintf(stderr, "FAIL: GetZeroTimeStamp status=%d\n", (int)theStatus); return 1; }
-    printf("OK: GetZeroTimeStamp sampleTime=%.0f hostTime=%llu\n", theSampleTime, (unsigned long long)theHostTime);
-
+    // each device's own ring buffer, writing a distinct pattern to each
+    // device, to prove both (a) the "virtual cable" loopback behavior
+    // works end to end, and (b) the 5 devices are fully isolated from
+    // each other (no cross-talk between e.g. "RVAD System" and
+    // "RVAD Game").
     const UInt32 kFrames = 8;
-    Float32 theWriteBuf[8 * 2];
-    for (UInt32 i = 0; i < kFrames * 2; ++i) theWriteBuf[i] = (Float32)(i + 1);
+    Float32 theWriteBufs[5][8 * 2];
+    Float32 theReadBufs[5][8 * 2];
 
-    AudioServerPlugInIOCycleInfo theCycle;
-    memset(&theCycle, 0, sizeof(theCycle));
-    theCycle.mOutputTime.mSampleTime = theSampleTime;
-    theCycle.mInputTime.mSampleTime = theSampleTime;
-
-    theStatus = theInterface->DoIOOperation(theDriver, 3, 5 /* output stream */, 1, kAudioServerPlugInIOOperationWriteMix, kFrames, &theCycle, theWriteBuf, NULL);
-    if (theStatus != 0) { fprintf(stderr, "FAIL: DoIOOperation write status=%d\n", (int)theStatus); return 1; }
-
-    Float32 theReadBuf[8 * 2];
-    memset(theReadBuf, 0, sizeof(theReadBuf));
-    theStatus = theInterface->DoIOOperation(theDriver, 3, 4 /* input stream */, 1, kAudioServerPlugInIOOperationReadInput, kFrames, &theCycle, theReadBuf, NULL);
-    if (theStatus != 0) { fprintf(stderr, "FAIL: DoIOOperation read status=%d\n", (int)theStatus); return 1; }
-
-    if (memcmp(theWriteBuf, theReadBuf, sizeof(theWriteBuf)) != 0)
+    for (UInt32 d = 0; d < theDeviceCount; ++d)
     {
-        fprintf(stderr, "FAIL: ring buffer round trip mismatch\n");
-        for (UInt32 i = 0; i < kFrames * 2; ++i) fprintf(stderr, "  [%u] wrote=%.1f read=%.1f\n", i, theWriteBuf[i], theReadBuf[i]);
-        return 1;
+        theStatus = theInterface->StartIO(theDriver, theDeviceIDs[d], 1);
+        if (theStatus != 0) { fprintf(stderr, "FAIL: StartIO on device %u status=%d\n", theDeviceIDs[d], (int)theStatus); return 1; }
     }
-    printf("OK: output->input ring buffer round trip matches (virtual cable works)\n");
 
-    theInterface->StopIO(theDriver, 3, 1);
+    for (UInt32 d = 0; d < theDeviceCount; ++d)
+    {
+        Float64 theSampleTime = 0; UInt64 theHostTime = 0; UInt64 theSeed = 0;
+        theStatus = theInterface->GetZeroTimeStamp(theDriver, theDeviceIDs[d], 1, &theSampleTime, &theHostTime, &theSeed);
+        if (theStatus != 0) { fprintf(stderr, "FAIL: GetZeroTimeStamp on device %u status=%d\n", theDeviceIDs[d], (int)theStatus); return 1; }
+
+        // Distinct pattern per device: device index encoded into every
+        // sample so a cross-talk bug would be immediately visible.
+        for (UInt32 i = 0; i < kFrames * 2; ++i) theWriteBufs[d][i] = (Float32)((d + 1) * 100 + i);
+
+        AudioServerPlugInIOCycleInfo theCycle;
+        memset(&theCycle, 0, sizeof(theCycle));
+        theCycle.mOutputTime.mSampleTime = theSampleTime;
+        theCycle.mInputTime.mSampleTime = theSampleTime;
+
+        theStatus = theInterface->DoIOOperation(theDriver, theDeviceIDs[d], theOutputStreamIDs[d], 1, kAudioServerPlugInIOOperationWriteMix, kFrames, &theCycle, theWriteBufs[d], NULL);
+        if (theStatus != 0) { fprintf(stderr, "FAIL: DoIOOperation write on device %u status=%d\n", theDeviceIDs[d], (int)theStatus); return 1; }
+
+        memset(theReadBufs[d], 0, sizeof(theReadBufs[d]));
+        theStatus = theInterface->DoIOOperation(theDriver, theDeviceIDs[d], theInputStreamIDs[d], 1, kAudioServerPlugInIOOperationReadInput, kFrames, &theCycle, theReadBufs[d], NULL);
+        if (theStatus != 0) { fprintf(stderr, "FAIL: DoIOOperation read on device %u status=%d\n", theDeviceIDs[d], (int)theStatus); return 1; }
+
+        if (memcmp(theWriteBufs[d], theReadBufs[d], sizeof(theWriteBufs[d])) != 0)
+        {
+            fprintf(stderr, "FAIL: ring buffer round trip mismatch on device %u (\"%s\")\n", theDeviceIDs[d], theNames[d]);
+            for (UInt32 i = 0; i < kFrames * 2; ++i) fprintf(stderr, "  [%u] wrote=%.1f read=%.1f\n", i, theWriteBufs[d][i], theReadBufs[d][i]);
+            return 1;
+        }
+    }
+    printf("OK: output->input ring buffer round trip matches on all %u devices (virtual cables work)\n", theDeviceCount);
+
+    // Cross-check for isolation: device d's captured audio must match
+    // ONLY device d's own written pattern, never another device's.
+    for (UInt32 d = 0; d < theDeviceCount; ++d)
+    {
+        for (UInt32 other = 0; other < theDeviceCount; ++other)
+        {
+            if (other == d) continue;
+            if (memcmp(theReadBufs[d], theWriteBufs[other], sizeof(theReadBufs[d])) == 0)
+            {
+                fprintf(stderr, "FAIL: device %u's input matches device %u's output -- cross-talk between virtual devices!\n", theDeviceIDs[d], theDeviceIDs[other]);
+                return 1;
+            }
+        }
+    }
+    printf("OK: no cross-talk between any of the %u virtual devices\n", theDeviceCount);
+
+    for (UInt32 d = 0; d < theDeviceCount; ++d)
+    {
+        theInterface->StopIO(theDriver, theDeviceIDs[d], 1);
+    }
 
     printf("ALL CHECKS PASSED\n");
     return 0;
